@@ -61,6 +61,44 @@ def taubin_circle_fit(points: np.ndarray) -> tuple[tuple[float, float], float, f
     return (float(center_x), float(center_y)), float(radius), residual
 
 
+def pratt_circle_fit(points: np.ndarray) -> tuple[tuple[float, float], float, float]:
+    """Pratt algebraic circle fit (stable for small arcs). Returns (center, radius, residual)."""
+    if len(points) < 3:
+        raise ValueError("Need at least 3 points for circle fit")
+
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    x = pts[:, 0]
+    y = pts[:, 1]
+    mx, my = float(np.mean(x)), float(np.mean(y))
+    u = x - mx
+    v = y - my
+    suu = float(np.sum(u * u))
+    suv = float(np.sum(u * v))
+    svv = float(np.sum(v * v))
+    suuu = float(np.sum(u * u * u))
+    svvv = float(np.sum(v * v * v))
+    suuv = float(np.sum(u * u * v))
+    suvv = float(np.sum(u * v * v))
+
+    a = suu
+    b = suv
+    c = svv
+    d = 0.5 * (suuu + suvv)
+    e = 0.5 * (svvv + suuv)
+    det = a * c - b * b
+    if abs(det) < 1e-12:
+        raise ValueError("Degenerate Pratt circle fit")
+    uc = (d * c - b * e) / det
+    vc = (a * e - b * d) / det
+    radius = float(np.sqrt(uc * uc + vc * vc + (suu + svv) / len(pts)))
+    if radius <= 0 or not np.isfinite(radius):
+        raise ValueError("Degenerate Pratt circle fit")
+    center = (mx + uc, my + vc)
+    distances = np.sqrt((x - center[0]) ** 2 + (y - center[1]) ** 2)
+    residual = float(np.std(distances - radius))
+    return center, radius, residual
+
+
 def geometric_circle_fit(points: np.ndarray) -> tuple[tuple[float, float], float, float]:
     """Nonlinear least-squares geometric circle fit."""
     if len(points) < 3:
@@ -77,6 +115,22 @@ def geometric_circle_fit(points: np.ndarray) -> tuple[tuple[float, float], float
     cx, cy, r = result.x
     residual = float(np.sqrt(np.mean(result.fun**2)))
     return (float(cx), float(cy)), float(abs(r)), residual
+
+
+def fit_circle(
+    points: np.ndarray,
+    method: str = "taubin",
+) -> tuple[tuple[float, float], float, float, str]:
+    """Dispatch Pratt / Taubin / least-squares circle fit. Returns (center, r, residual, method)."""
+    key = (method or "taubin").strip().lower().replace("-", "_")
+    if key in ("pratt",):
+        center, radius, residual = pratt_circle_fit(points)
+        return center, radius, residual, "pratt"
+    if key in ("least_squares", "ls", "geometric", "nls"):
+        center, radius, residual = geometric_circle_fit(points)
+        return center, radius, residual, "least_squares"
+    center, radius, residual = taubin_circle_fit(points)
+    return center, radius, residual, "taubin"
 
 
 def _circle_overlap_confidence(
@@ -328,7 +382,11 @@ def aggregate_radii(results: list[RadiusResult], method: str = "mean") -> dict:
 
 
 def classify_tip_condition(radius_nm: float, config: dict) -> TipCondition:
-    """Classify tip as Sharp / Moderate / Blunt based on radius thresholds."""
+    """Classify tip from Method 1 radius (primary l = 100 nm).
+
+    Small radius = sharper tip; large radius = more rounded / blunt.
+    Defaults: ≤10 nm sharp, ≤50 nm moderate, else blunt.
+    """
     cfg = config.get("tip_classification", {})
     sharp_max = cfg.get("sharp_max_nm", 10.0)
     moderate_max = cfg.get("moderate_max_nm", 50.0)

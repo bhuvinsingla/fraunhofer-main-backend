@@ -20,7 +20,7 @@ calibration:
 
 preprocessing:
   border_margin_px: 10
-  info_bar_crop_ratio: 0.0
+  info_bar_crop_ratio: 0.15   # fallback ratio; window-vs-window detector preferred
   denoise_method: "bilateral"
   clahe_clip_limit: 2.0
   clahe_tile_size: 8
@@ -33,6 +33,23 @@ preprocessing:
   nlm_h: 0.08
   nlm_patch_size: 5
   nlm_patch_distance: 6
+
+# Multi-scale structural asperity filter (wedge → top-hat ridge → track → peaks)
+# Filters OpenCV ridge peaks to those aligned with true structural discontinuities.
+multi_scale:
+  use_multi_scale_std: true
+  wedge_blur_ksize: 51
+  wedge_dilate_px: 8
+  tophat_ksize: 15
+  track_max_gap: 6
+  track_search_half_width: 12
+  peak_smooth_sigma: 2.0
+  peak_prominence: 2.0
+  peak_min_distance: 8
+  peak_kind: auto             # max | min | auto
+  y_tol_px: 12.0              # CV peak must match a multi-scale peak within this Y
+  x_tol_px: null              # null → Y-only match; set e.g. 25.0 for XY gate
+  snap_px: 30.0               # when filtering empties, snap MS peaks to nearest CV/edge
 
 edge_detection:
   edge_mode: "canny_scharr"
@@ -58,6 +75,13 @@ edge_detection:
   skyline_min_distance: 3
   row_skyline_prominence: 1.0
   row_skyline_min_distance: 4
+  # 1D ridge projection asperity detection (core of detect_serration_peaks_global)
+  # residual = smoothed_spline(skyline) - skyline; find_peaks(residual)
+  spline_smoothing: null          # absolute UnivariateSpline s; null → N * factor
+  spline_smoothing_factor: 50.0   # used when spline_smoothing is null
+  ridge_peak_prominence: 2.0
+  ridge_peak_distance: 10
+  global_use_skyline_supplement: false
   peak_dedup_distance: 5.0
   blade_margin_ratio: 0.05
   global_use_harris: false
@@ -66,14 +90,121 @@ edge_detection:
   hough_line_min_length: 30
   hough_line_max_gap: 10
 
+# OCR — SEM footer / info-bar text extraction only
+# OpenAI Vision used ONLY when OPENAI_API_KEY is set in .env (footer crop)
+ocr:
+  engine: unlimited          # unlimited | openai | rapid | auto
+  region: both               # full | footer | both
+  use_openai: true           # call OpenAI Vision for footer if key present
+  openai_model: null         # null → OPENAI_OCR_MODEL or gpt-4o-mini
+  openai_timeout_s: 120
+  unlimited_url: null        # e.g. http://127.0.0.1:10000  (or set UNLIMITED_OCR_URL)
+  unlimited_model: baidu/Unlimited-OCR
+  unlimited_prompt: "<image>document parsing."
+  image_mode: gundam
+  ngram_window: 128
+  max_length: 32768
+  timeout_s: 600
+
+# Tip detection for Approach 1 (Method 1)
+tip_detection:
+  # ridge = 1D ridge all asperities | arch = complete-arch only |
+  # qwen  = Qwen2.5-VL proposes V-apexes, snapped to CV ridge peaks (needs requirements-qwen.txt)
+  mode: ridge                 # ridge = fast/reliable Methods 1–3 (PDF brainstorming)
+  ridge_skip_stability: false # if true, skip 0.9–1.1l stability reject
+
+# Qwen2.5-VL hybrid apex detection (only used when tip_detection.mode == "qwen").
+# VLM understands the V-lamellae structure and outputs approximate apex (x, y);
+# each is then snapped to the nearest classical-CV ridge peak for sub-pixel accuracy.
+# Runs fully offline once weights are downloaded. Falls back to CV peaks if the
+# model/deps are unavailable.
+qwen:
+  # 7B needs ~14GB+ RAM; this machine has ~8GB → use 3B (still local/offline after download)
+  model_id: "Qwen/Qwen2.5-VL-3B-Instruct"
+  device_map: "auto"
+  torch_dtype: "float32"      # float16 segfaults on CPU without CUDA
+  # Page weights to disk so the model fits in ~8GB RAM (slow on CPU, but works)
+  offload_folder: "uploads/qwen_offload"
+  max_memory:
+    cpu: "4GiB"
+  max_new_tokens: 256
+  coord_space: absolute       # absolute | normalized_1000 (rescale 0..1000 → pixels)
+  snap_px: 25.0               # snap Qwen apex to nearest CV peak within this radius
+  keep_unmatched: true        # keep Qwen apexes with no nearby CV peak
+  subprocess: true            # run VLM in child process (protects API from native crashes)
+  timeout_s: 900              # max seconds for one Qwen inference job
+  prompt: null                # null → built-in V-apex JSON prompt
+
+# Approach 3 — OpenAI (not Gemini): peaks → ROI contour → OpenCV refine → circle fit
+# Uses OPENAI_API_KEY / OPENAI_VLM_MODEL from .env (same key as footer OCR).
+openai_vlm_approach:
+  enabled: true
+  model: null                 # null → OPENAI_VLM_MODEL or OPENAI_OCR_MODEL or gpt-4o-mini
+  timeout_s: 120
+  max_tokens: 2048
+  contour_max_tokens: 1024
+  coord_space: absolute
+  snap_px: 80.0               # snap OpenAI peak proposals to nearest CV ridge tip
+  keep_unmatched: false       # drop VLM peaks that do not land near a CV tip
+  max_peaks: 40
+  roi_half_size_px: 48        # crop half-size around each detected peak
+  min_contour_points: 8
+  min_confidence: 0.0
+  edge_search_px: 4.0         # OpenCV snap distance from VLM contour to Canny edges
+  canny1: 40
+  canny2: 120
+  circle_fit: taubin          # pratt | taubin | least_squares
+  min_radius_px: 2.0
+  max_radius_px: 80.0         # tip-local circle; larger values are usually flank fits
+  fit_window_px: 28.0         # only fit edge points within this distance of the tip
+  max_radius_nm: 150.0        # reject unphysically large tip radii
+  min_seed_peaks: 5
+  peak_prompt: null           # null → built-in peak-detection prompt
+  contour_prompt: null        # null → built-in apex-outline prompt
+
+# Approach 2 — vertex-form parabola fit on ridge skyline
+# y = a(x − h)² + k   (purple curve, pink vertex)
+# https://stackoverflow.com/questions/15587311/compute-parabola-using-python
+# https://math.stackexchange.com/questions/1631819/vertex-form-of-parabola-why-does-it-work
+parabola_approach:
+  window_px: 40
+  step_px: 8
+  max_rel_residual: 0.08
+  min_radius_px: 5.0          # osculating R = 1/(2|a|) at vertex
+  max_radius_px: 150.0
+  dedup_vertex_px: 12.0
+
+# Detect the topmost vertex of each parabola-like arch on the central spine.
+# When enabled, these apexes are the tips measured by Methods 1/2/3.
+parabola_apex:
+  enabled: true
+  min_apexes: 2          # fall back to serration peaks if fewer than this found
+  tophat_ksize: 13       # white top-hat kernel to isolate thin bright ridges
+  min_area_px: 80        # ignore tiny bright specks
+  min_width_px: 10       # arch must span some width
+  descend_px: 5          # how far below apex to test for both-side descent
+  side_px: 5             # lateral offset defining "both sides" of the vertex
+  auto_spine: true       # auto-locate the spine from the vertices (handles off-center edges)
+  spine_tol_px: 60.0     # keep apexes within this distance of the fitted spine line
+  spine_min_inliers: 3   # min vertices needed to trust the spine fit
+  sanity_x_lo: 0.12      # wide sanity bound so we never latch onto a flank cluster
+  sanity_x_hi: 0.88
+  central_x_lo: 0.28     # fixed-band fallback used only if spine fit fails
+  central_x_hi: 0.74
+  dedup_px: 20.0         # merge apexes closer than this
+  top_margin_px: 15      # drop fragments touching the very top edge
+  max_apexes: 20
+
 tip_validation:
   min_branch_points: 20
   border_px: 10
+  drop_border_tips: true       # skip edge-touching (incomplete) apexes instead of marking them
   minimum_tip_spacing_nm: 40.0
   max_fit_residual_px: 2.0
   min_contour_length_px: 40
   method1_stability_threshold: 0.20
-  method2_min_cross: 0.15
+  method2_min_cross: 0.08
+  method2_max_l_nm: 250.0        # reject far-away projected apexes (runaway flanks)
 
 shape_detection:
   adaptive_block_size: 11
@@ -115,10 +246,12 @@ protocol:
   approved: false
   approved_by: null
   notes: >
-    Proposed defaults pending client approval of Method 1 l, Method 2 fit band,
-    and Method 3 Interpretation A (angle at D). See docs/CALCULATION_BASIS.md.
-  method1_distances_nm: [25, 50, 100, 200]
-  method1_primary_nm: 100
+    Method 1 (primary): apex → drop l = 50 nm (vertical) → horizontal chord at
+    left/right edges → circumcircle through three points = tip radius. Small R =
+    sharper; large R = more rounded/blunt. Method 2 fit band and Method 3 D pending
+    client approval.
+  method1_distances_nm: [50]
+  method1_primary_nm: 50
   method2_fit_band_nm: [50, 200]
   method3_circle_diameter_nm: 100
   method3_definition: "interpretation_A_circle_at_apex"
@@ -132,11 +265,11 @@ measurement_methods:
   plausible_radius_nm: [2, 500]
   require_outer_surface: false
   fixed_distance_circle:
-    distances_nm: [25, 50, 100, 200]
-    primary_nm: 100
+    distances_nm: [50]
+    primary_nm: 50
   projected_tip_distance:
     fit_band_nm: [50, 200]
-    min_flank_points: 5
+    min_flank_points: 4
   inscribed_angle:
     circle_diameter_nm: 100
     tangent_from: "apex_to_intersections"

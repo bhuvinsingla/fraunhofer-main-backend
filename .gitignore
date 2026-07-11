@@ -25,6 +25,10 @@ uploads/
 output/
 
 # Environment and secrets
+.env
+.env.local
+.env.*.local
+!.env.example
 
 # IDE and OS
 .idea/

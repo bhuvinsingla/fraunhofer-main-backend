@@ -1,12 +1,14 @@
-"""Peak detection: multi-algorithm consensus edges + Harris/skyline peaks."""
+"""Peak detection: multi-algorithm consensus edges + Harris/skyline/1D-ridge peaks."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 import cv2
 import numpy as np
 from scipy import signal
+from scipy.interpolate import UnivariateSpline
 
 from sem_analysis.consensus_edges import build_consensus_edges, edge_canny
 
@@ -170,6 +172,99 @@ def _row_skyline_peaks(edge_map: np.ndarray, config: dict) -> np.ndarray:
     return np.column_stack([profile[all_idx], ys_valid[all_idx]])
 
 
+def _extract_skyline_y(edge_map: np.ndarray) -> np.ndarray:
+    """Column-wise topmost edge y (NaN where no edge)."""
+    h, w = edge_map.shape[:2]
+    skyline = np.full(w, np.nan, dtype=np.float64)
+    for x in range(w):
+        ys = np.where(edge_map[:, x] > 0)[0]
+        if len(ys) > 0:
+            skyline[x] = float(ys.min())
+    return skyline
+
+
+def _detect_peaks_1d_ridge(
+    edge_map: np.ndarray,
+    config: dict,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """
+    1D ridge projection for asperity peak detection.
+
+    1. Extract topmost edge pixels (skyline) per x
+    2. Interpolate gaps
+    3. Fit heavily smoothed UnivariateSpline (macroscopic ridge)
+    4. Relative asperity height = smoothed − raw skyline
+       (tips stick upward → smaller y → positive residual)
+    5. scipy.signal.find_peaks on that 1D residual
+    """
+    cfg = config.get("edge_detection", {})
+    h, w = edge_map.shape[:2]
+    meta: dict[str, Any] = {"method": "1d_ridge_projection"}
+
+    skyline = _extract_skyline_y(edge_map)
+    xs = np.arange(w, dtype=np.float64)
+    valid = ~np.isnan(skyline)
+    n_valid = int(valid.sum())
+    meta["n_skyline_valid"] = n_valid
+    if n_valid < 10:
+        meta["status"] = "too_few_skyline_points"
+        return np.empty((0, 2), dtype=np.float64), meta
+
+    # Interpolate gaps across full width
+    skyline_filled = skyline.copy()
+    skyline_filled[~valid] = np.interp(xs[~valid], xs[valid], skyline[valid])
+
+    # Heavily smoothed spline → macroscopic ridge shape
+    # s ~ N * sigma^2; large s = stronger smoothing
+    default_s = float(n_valid) * float(cfg.get("spline_smoothing_factor", 50.0))
+    spl_s_cfg = cfg.get("spline_smoothing")
+    spl_s = default_s if spl_s_cfg is None else float(spl_s_cfg)
+    spl_s = max(spl_s, 1.0)
+    try:
+        spline = UnivariateSpline(xs, skyline_filled, s=spl_s, k=min(3, max(1, n_valid - 1)))
+        smooth = np.asarray(spline(xs), dtype=np.float64)
+    except Exception as exc:
+        meta["status"] = f"spline_failed: {exc}"
+        # Fallback: very wide moving average
+        k = max(51, (w // 20) | 1)
+        kernel = np.ones(k, dtype=np.float64) / k
+        smooth = np.convolve(skyline_filled, kernel, mode="same")
+
+    # Relative height of asperities (positive at tips)
+    residual = smooth - skyline_filled
+
+    prominence = float(cfg.get("ridge_peak_prominence", cfg.get("skyline_prominence", 2.0)))
+    distance = int(cfg.get("ridge_peak_distance", cfg.get("skyline_min_distance", 10)))
+    height = cfg.get("ridge_peak_height")  # optional absolute residual threshold
+
+    kwargs: dict[str, Any] = {"prominence": prominence, "distance": max(1, distance)}
+    if height is not None:
+        kwargs["height"] = float(height)
+
+    peak_idx, props = signal.find_peaks(residual, **kwargs)
+    peaks = (
+        np.column_stack([xs[peak_idx], skyline_filled[peak_idx]])
+        if len(peak_idx)
+        else np.empty((0, 2), dtype=np.float64)
+    )
+
+    meta.update(
+        {
+            "status": "ok",
+            "spline_smoothing": spl_s,
+            "ridge_peak_prominence": prominence,
+            "ridge_peak_distance": distance,
+            "n_peaks": int(len(peaks)),
+            "residual_max": float(np.max(residual)) if len(residual) else None,
+            "residual_mean": float(np.mean(residual)) if len(residual) else None,
+            "prominences": props.get("prominences", np.array([])).tolist()
+            if "prominences" in props
+            else [],
+        }
+    )
+    return peaks, meta
+
+
 def _deduplicate_peaks(peaks: np.ndarray, min_dist: float = 10.0) -> np.ndarray:
     """Merge peaks from Harris and skyline that are within min_dist pixels."""
     if len(peaks) == 0:
@@ -235,7 +330,11 @@ def detect_serration_peaks_global(
     config: dict,
     shape_id: int = 0,
 ) -> EdgePeakResult:
-    """Detect all micro-serration peaks along the full blade edge (image-wide)."""
+    """Detect all micro-serration / asperity peaks along the full blade edge.
+
+    Core detector: 1D ridge projection (skyline − smoothed spline → find_peaks).
+    Optional supplements: Harris / classic skyline / row-skyline when enabled.
+    """
     cfg = config.get("edge_detection", {})
     edge_map = _build_edge_map(image, config)
     consensus_meta = dict(getattr(_build_edge_map, "last_meta", {}) or {})
@@ -246,19 +345,34 @@ def detect_serration_peaks_global(
     edge_map[:, :margin] = 0
     edge_map[:, w - margin :] = 0
 
-    harris = (
-        _filter_peaks_near_centerline(
+    # Core: 1D ridge projection asperity peaks
+    ridge_peaks, ridge_meta = _detect_peaks_1d_ridge(edge_map, config)
+
+    parts: list[np.ndarray] = []
+    if len(ridge_peaks) > 0:
+        parts.append(ridge_peaks)
+
+    # Optional legacy supplements (off by default when 1D ridge is primary)
+    if cfg.get("global_use_harris", False):
+        harris = _filter_peaks_near_centerline(
             _harris_peaks(edge_map, config, full_blade=True),
             edge_map,
             max_dist_px=cfg.get("harris_centerline_dist_px", 12.0),
         )
-        if cfg.get("global_use_harris", False)
-        else np.empty((0, 2), dtype=np.float64)
-    )
-    skyline = _skyline_peaks(edge_map, config)
-    row_skyline = _row_skyline_peaks(edge_map, config)
+    else:
+        harris = np.empty((0, 2), dtype=np.float64)
 
-    parts = [p for p in (harris, skyline, row_skyline) if len(p) > 0]
+    if cfg.get("global_use_skyline_supplement", False):
+        skyline = _skyline_peaks(edge_map, config)
+        row_skyline = _row_skyline_peaks(edge_map, config)
+    else:
+        skyline = np.empty((0, 2), dtype=np.float64)
+        row_skyline = np.empty((0, 2), dtype=np.float64)
+
+    for p in (harris, skyline, row_skyline):
+        if len(p) > 0:
+            parts.append(p)
+
     if parts:
         combined = np.vstack(parts)
     else:
@@ -268,9 +382,9 @@ def detect_serration_peaks_global(
         combined, min_dist=cfg.get("peak_dedup_distance", 5.0)
     )
 
-    # Sort peaks top-to-bottom along blade edge
+    # Sort peaks left-to-right along the ridge (then top-to-bottom)
     if len(peak_locations) > 0:
-        peak_locations = peak_locations[np.argsort(peak_locations[:, 1])]
+        peak_locations = peak_locations[np.lexsort((peak_locations[:, 1], peak_locations[:, 0]))]
 
     ys, xs = np.where(edge_map > 0)
     edge_points = np.column_stack([xs.astype(np.float64), ys.astype(np.float64)])
@@ -283,6 +397,9 @@ def detect_serration_peaks_global(
         edge_map=edge_map,
         hough_lines=hough_lines,
         metadata={
+            "method": "1d_ridge_projection",
+            "ridge_count": len(ridge_peaks),
+            "ridge": ridge_meta,
             "harris_count": len(harris),
             "skyline_count": len(skyline),
             "row_skyline_count": len(row_skyline),

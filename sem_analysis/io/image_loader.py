@@ -160,20 +160,42 @@ def build_calibration_record(
     """Phase-1 calibration record for API / audit trail."""
     meta = sem_image.metadata or {}
     companion = _load_companion_calibration_record(Path(sem_image.source_path)) or {}
+    auto = meta.get("auto_calibration") or {}
     tilt = tilt_info or sem_image.tilt_correction or {}
     raw = float(sem_image.nm_per_pixel_raw if sem_image.nm_per_pixel_raw is not None else sem_image.nm_per_pixel)
+    source = (
+        companion.get("calibration_source")
+        or auto.get("calibration_source")
+        or ("companion" if companion else (
+            "tiff_metadata" if meta.get("pixel_size_nm") or meta.get("nm_per_pixel") else "config_default"
+        ))
+    )
+    extracted = auto.get("extracted_values") or {}
+    ocr = auto.get("ocr")
     return {
         "image": Path(sem_image.source_path).name,
-        "magnification": companion.get("magnification") or meta.get("magnification"),
-        "scale_bar_nm": companion.get("scale_bar_nm"),
-        "scale_bar_pixels": companion.get("scale_bar_pixels"),
+        "magnification": companion.get("magnification") or meta.get("magnification") or auto.get("magnification") or extracted.get("magnification"),
+        "scale_bar_nm": companion.get("scale_bar_nm") if companion.get("scale_bar_nm") is not None else (auto.get("scale_bar_nm") if auto.get("scale_bar_nm") is not None else extracted.get("scale_bar_nm")),
+        "scale_bar_pixels": companion.get("scale_bar_pixels") if companion.get("scale_bar_pixels") is not None else auto.get("scale_bar_pixels"),
         "nm_per_pixel_raw": raw,
         "nm_per_pixel": float(sem_image.nm_per_pixel),
-        "stage_tilt_deg": tilt.get("tilt_angle_deg"),
+        "stage_tilt_deg": tilt.get("tilt_angle_deg") if tilt.get("tilt_angle_deg") is not None else extracted.get("stage_tilt_deg"),
         "tilt_corrected": bool(tilt.get("applied")),
         "resized": bool(companion.get("resized", False)),
-        "calibration_source": companion.get("calibration_source")
-        or ("companion" if companion else ("tiff_metadata" if meta else "config_default")),
+        "calibration_source": source,
+        "auto_calibration": auto or None,
+        "extracted_values": extracted or None,
+        "zeiss_all": auto.get("zeiss_all") or None,
+        "ocr": {
+            "engine": (ocr or {}).get("engine"),
+            "ok": (ocr or {}).get("ok"),
+            "mode": (ocr or {}).get("mode"),
+            "raw_text": (ocr or {}).get("raw_text"),
+            "raw_model_output": (ocr or {}).get("raw_model_output"),
+            "values": (ocr or {}).get("values"),
+            "lines": (ocr or {}).get("lines"),  # unlimited — all lines
+            "errors": (ocr or {}).get("errors"),
+        } if ocr else None,
     }
 
 
@@ -251,6 +273,26 @@ def load_image(
 
     if companion_record:
         metadata = {**metadata, "calibration_record": companion_record}
+
+    # Auto-calibrate from Zeiss SmartSEM tag / footer scale bar when still at default
+    companion_nm = None
+    if companion_record and companion_record.get("nm_per_pixel") is not None:
+        try:
+            companion_nm = float(companion_record["nm_per_pixel"])
+        except (TypeError, ValueError):
+            companion_nm = None
+    # Manual override / uploaded companion wins; otherwise auto-detect every time
+    if companion_nm is not None and companion_record.get("calibration_source") == "manual_override":
+        nm_per_pixel = companion_nm
+    else:
+        from sem_analysis.io.scale_calibration import calibrate_from_image
+
+        auto = calibrate_from_image(path, image=data, config=config)
+        metadata["auto_calibration"] = auto
+        if auto.get("nm_per_pixel"):
+            nm_per_pixel = float(auto["nm_per_pixel"])
+        elif companion_nm is not None:
+            nm_per_pixel = companion_nm
 
     return SEMImage(
         data=data,

@@ -1,0 +1,19 @@
+# Optional dependencies for the Qwen2.5-VL hybrid apex detector
+# (tip_detection.mode: qwen). These are heavy (multi-GB model download + torch);
+# install only if you want the VLM-assisted peak detection:
+#
+#   python -m venv qwen_env
+#   qwen_env\Scripts\activate            # Windows
+#   pip install -r requirements-qwen.txt
+#
+# For CUDA builds of torch, follow https://pytorch.org/get-started/locally/
+# The model weights (Qwen/Qwen2.5-VL-7B-Instruct) download on first use and then
+# run completely offline.
+
+torch
+torchvision
+torchaudio
+transformers>=4.49.0
+accelerate
+qwen-vl-utils
+pillow

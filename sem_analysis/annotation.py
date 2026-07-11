@@ -22,6 +22,8 @@ BLUE = (255, 0, 0)
 CYAN = (255, 255, 0)
 GREEN = (0, 255, 0)
 MAGENTA = (255, 0, 255)
+PURPLE = (180, 0, 180)       # parabola curves (Approach 2)
+PINK = (180, 105, 255)       # vertices (h,k) (Approach 2) — light pink in BGR
 
 
 def _draw_scale_bar(ax, nm_per_pixel: float, scale_bar_nm: float, position: str = "bottom-right") -> None:
@@ -68,16 +70,29 @@ def _draw_dot(img: np.ndarray, point: tuple[float, float] | list[float], color: 
 
 
 def _draw_vertical_l(img: np.ndarray, coords: list[float], label: str = "l") -> None:
+    """PDF red vertical bracket with end ticks + 'l' label."""
     if len(coords) < 4:
         return
-    x, y_top, _, y_bottom = (int(v) for v in coords[:4])
-    y_top, y_bottom = int(min(y_top, y_bottom)), int(max(y_top, y_bottom))
+    vals = [float(v) for v in coords[:4]]
+    x = int(round(0.5 * (vals[0] + vals[2])))
+    y_top = int(round(min(vals[1], vals[3])))
+    y_bottom = int(round(max(vals[1], vals[3])))
+    if y_bottom - y_top < 2:
+        return
     cv2.line(img, (x, y_top), (x, y_bottom), RED, 2, cv2.LINE_AA)
     tick = 8
     cv2.line(img, (x - tick, y_top), (x + tick, y_top), RED, 2, cv2.LINE_AA)
     cv2.line(img, (x - tick, y_bottom), (x + tick, y_bottom), RED, 2, cv2.LINE_AA)
-    cv2.putText(img, label, (x + 10, (y_top + y_bottom) // 2),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, RED, 1, cv2.LINE_AA)
+    cv2.putText(
+        img,
+        label,
+        (x + 10, (y_top + y_bottom) // 2),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        RED,
+        2,
+        cv2.LINE_AA,
+    )
 
 
 def _draw_polyline(img: np.ndarray, points: list, color: tuple, thickness: int = 1) -> None:
@@ -209,13 +224,18 @@ def annotate_whiteboard_image(
 
 
 def _draw_method1_curve(img: np.ndarray, curve: dict, index: int) -> None:
-    """Method 1: blue dots, red scan line, cyan inscribed circle, R label."""
-    tip = curve.get("tip_point")
+    """Method 1 PDF overlay: 3 blue dots, red vertical l, red horizontal chord, cyan circle."""
+    tip = curve.get("tip_point") or curve.get("peak_location")
     left = curve.get("intersection_left")
     right = curve.get("intersection_right")
     center = curve.get("center")
     radius_px = curve.get("radius_px")
     scan_line = curve.get("scan_line", [])
+    vertical_l = curve.get("vertical_l_line", [])
+    rejected = curve.get("valid") is False or bool(
+        curve.get("rejection_reason") or curve.get("method1_rejection_reason")
+    )
+    reason = curve.get("rejection_reason") or curve.get("method1_rejection_reason")
 
     if tip:
         _draw_dot(img, tip, BLUE)
@@ -223,42 +243,67 @@ def _draw_method1_curve(img: np.ndarray, curve: dict, index: int) -> None:
         _draw_dot(img, left, BLUE, 3)
     if right:
         _draw_dot(img, right, BLUE, 3)
+    if vertical_l:
+        _draw_vertical_l(img, vertical_l, "l")
+    elif tip and left and right:
+        mid_x = 0.5 * (float(left[0]) + float(right[0]))
+        mid_y = 0.5 * (float(left[1]) + float(right[1]))
+        _draw_vertical_l(img, [float(tip[0]), float(tip[1]), mid_x, mid_y], "l")
     if scan_line:
         _draw_line(img, scan_line, RED, 2)
-    if center and radius_px:
+    if center and radius_px and not rejected:
         cv2.circle(img, (int(center[0]), int(center[1])), max(3, int(radius_px)), CYAN, 1, cv2.LINE_AA)
 
     peak = curve.get("peak_location") or tip
-    if peak and curve.get("radius_nm") is not None:
+    if peak:
         px, py = int(peak[0]), int(peak[1])
-        label = f"R={curve['radius_nm']:.1f}nm"
         ly = py - 6 if index % 2 == 0 else py + 12
-        cv2.putText(img, label, (px + 6, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.32, YELLOW, 1, cv2.LINE_AA)
+        if rejected:
+            label = f"R fail: {reason or 'invalid'}"
+            if reason == "no_intersection":
+                label = "R fail: no_intersection (check nm/px)"
+            cv2.putText(img, label, (px + 6, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.32, RED, 1, cv2.LINE_AA)
+        elif curve.get("radius_nm") is not None:
+            label = f"R={curve['radius_nm']:.1f}nm"
+            cv2.putText(img, label, (px + 6, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.32, YELLOW, 1, cv2.LINE_AA)
 
 
 def _draw_method2_curve(img: np.ndarray, curve: dict, index: int) -> None:
-    """Method 2: prefer full whiteboard style when geometry is present."""
-    if curve.get("alpha_arc") or curve.get("circle_center"):
-        _draw_whiteboard_tip(img, curve, index)
-        return
+    """Method 2 PDF overlay: yellow projected edges → convergent tip, blue ultimate tip, red l."""
     _draw_line(img, curve.get("left_line", []), YELLOW, 2)
     _draw_line(img, curve.get("right_line", []), YELLOW, 2)
-    _draw_d_bracket(img, curve.get("vertical_l_line", []), "d")
-    tip = curve.get("tip_point")
+
+    projected = curve.get("convergence_point") or curve.get("projected_tip")
+    if projected:
+        _draw_dot(img, projected, YELLOW, 5)
+
+    arc = curve.get("tip_apex_arc") or []
+    if len(arc) >= 2:
+        _draw_polyline(img, arc, BLUE, 2)
+    tip = curve.get("tip_point") or curve.get("peak_location")
     if tip:
-        _draw_caret(img, tip, BLUE)
+        _draw_dot(img, tip, BLUE, 4)
+
+    vertical_l = curve.get("vertical_l_line", [])
+    if vertical_l:
+        _draw_vertical_l(img, vertical_l, "l")
+    elif projected and tip:
+        _draw_vertical_l(
+            img,
+            [float(projected[0]), float(projected[1]), float(projected[0]), float(tip[1])],
+            "l",
+        )
+
     peak = curve.get("peak_location") or tip
     if peak and curve.get("distance_l_nm") is not None:
         px, py = int(peak[0]), int(peak[1])
-        label = f"d={curve['distance_l_nm']:.1f}nm"
-        if curve.get("included_angle_deg") is not None:
-            label += f"  a={curve['included_angle_deg']:.1f}"
-        ly = py - 6 if index % 2 == 0 else py + 12
-        cv2.putText(img, label, (px + 6, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.32, YELLOW, 1, cv2.LINE_AA)
+        label = f"l={curve['distance_l_nm']:.1f}nm"
+        ly = py - 6 if index % 2 == 0 else py + 14
+        cv2.putText(img, label, (px + 8, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.38, RED, 1, cv2.LINE_AA)
 
 
 def _draw_method3_curve(img: np.ndarray, curve: dict, index: int) -> None:
-    """Method 3: fixed circle, tangent lines, theta label."""
+    """Method 3 PDF overlay: cyan fixed-D circle, yellow rays tip→edge, θ label."""
     center = curve.get("circle_center")
     radius_px = curve.get("circle_radius_px")
     if center and radius_px:
@@ -324,9 +369,140 @@ def annotate_method1_image(
     img = _base_image(image)
     for i, curve in enumerate(per_curve):
         _draw_method1_curve(img, curve, i)
+    cv2.putText(
+        img,
+        "Method 1: blue=3 points  red=l + horizontal  cyan=circle",
+        (12, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        BLUE,
+        2,
+        cv2.LINE_AA,
+    )
     if output_path:
         _save_annotated(img, output_path, nm_per_pixel, config)
     return img
+
+
+def _draw_circular_arc_curve(img: np.ndarray, curve: dict, index: int) -> None:
+    """Approach 2: purple parabola/arc polyline + pink vertex (or circle center)."""
+    arc = curve.get("curve_points") or curve.get("arc_points") or []
+    if len(arc) >= 2:
+        pts = np.asarray(arc, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(img, [pts], False, PURPLE, 2, cv2.LINE_AA)
+        for p in arc[:: max(1, len(arc) // 12)]:
+            _draw_dot(img, p, PURPLE, 2)
+
+    # Pink vertex (parabola) or center (legacy circle)
+    vertex = curve.get("vertex") or curve.get("center")
+    if vertex:
+        _draw_dot(img, vertex, PINK, 5)
+        cx, cy = int(vertex[0]), int(vertex[1])
+        cv2.drawMarker(img, (cx, cy), PINK, cv2.MARKER_CROSS, 12, 2, cv2.LINE_AA)
+
+    # Optional faint circle if radius known (osculating at vertex)
+    r_px = curve.get("radius_px")
+    if vertex and r_px and curve.get("approach") == "circular_arc":
+        cv2.circle(
+            img,
+            (int(vertex[0]), int(vertex[1])),
+            max(3, int(r_px)),
+            PURPLE,
+            1,
+            cv2.LINE_AA,
+        )
+
+    tip = curve.get("tip_point") or curve.get("peak_location") or vertex
+    if tip and curve.get("radius_nm") is not None:
+        px, py = int(tip[0]), int(tip[1])
+        ly = py - 8 if index % 2 == 0 else py + 14
+        kind = "parab" if curve.get("approach") == "vertex_parabola" else "arc"
+        label = f"{kind} R={curve['radius_nm']:.1f}nm"
+        cv2.putText(img, label, (px + 6, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.32, PURPLE, 1, cv2.LINE_AA)
+
+
+def annotate_circular_arc_image(
+    image: np.ndarray,
+    per_curve: list[dict],
+    nm_per_pixel: float,
+    config: dict,
+    output_path: str | None = None,
+) -> np.ndarray:
+    """Approach 2 annotated image — purple parabola curves, pink vertices."""
+    img = _base_image(image)
+    for i, curve in enumerate(per_curve):
+        _draw_circular_arc_curve(img, curve, i)
+    cv2.putText(
+        img,
+        "Approach 2: purple=parabola curve  pink=vertex (h,k)",
+        (12, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        PURPLE,
+        2,
+        cv2.LINE_AA,
+    )
+    if output_path:
+        _save_annotated(img, output_path, nm_per_pixel, config)
+    return img
+
+
+annotate_parabola_image = annotate_circular_arc_image
+
+
+def _draw_approach3_curve(img: np.ndarray, curve: dict, index: int) -> None:
+    """Approach 3: green refined contour + cyan fitted circle + tip marker."""
+    contour = curve.get("contour_points") or curve.get("vlm_contour_points") or []
+    if len(contour) >= 2:
+        pts = np.asarray(contour, dtype=np.int32).reshape(-1, 1, 2)
+        cv2.polylines(img, [pts], False, GREEN, 2, cv2.LINE_AA)
+
+    center = curve.get("center")
+    r_px = curve.get("radius_px")
+    if center and r_px and float(r_px) > 0:
+        cx, cy = int(round(center[0])), int(round(center[1]))
+        cv2.circle(img, (cx, cy), max(2, int(round(float(r_px)))), CYAN, 2, cv2.LINE_AA)
+        _draw_dot(img, center, CYAN, 3)
+
+    tip = curve.get("tip_point") or curve.get("peak_location")
+    if tip:
+        _draw_dot(img, tip, YELLOW, 4)
+        if curve.get("radius_nm") is not None:
+            px, py = int(tip[0]), int(tip[1])
+            ly = py - 8 if index % 2 == 0 else py + 14
+            conf = curve.get("vlm_confidence")
+            conf_s = f" c={conf:.2f}" if isinstance(conf, (int, float)) else ""
+            label = f"R={curve['radius_nm']:.1f}nm{conf_s}"
+            cv2.putText(
+                img, label, (px + 6, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.32, GREEN, 1, cv2.LINE_AA
+            )
+
+
+def annotate_approach3_image(
+    image: np.ndarray,
+    per_curve: list[dict],
+    nm_per_pixel: float,
+    config: dict,
+    output_path: str | None = None,
+) -> np.ndarray:
+    """Approach 3 annotated image — OpenAI peaks/contours + fitted circles."""
+    img = _base_image(image)
+    for i, curve in enumerate(per_curve):
+        _draw_approach3_curve(img, curve, i)
+    cv2.putText(
+        img,
+        "Approach 3: yellow=peak  green=contour  cyan=fitted circle (OpenAI+OpenCV)",
+        (12, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        GREEN,
+        2,
+        cv2.LINE_AA,
+    )
+    if output_path:
+        _save_annotated(img, output_path, nm_per_pixel, config)
+    return img
+
 
 
 def annotate_method2_image(
@@ -336,10 +512,20 @@ def annotate_method2_image(
     config: dict,
     output_path: str | None = None,
 ) -> np.ndarray:
-    """Method 2 annotated image — projected tip distance per curve."""
+    """Method 2 annotated image — projected tip distance per curve (PDF slide 3)."""
     img = _base_image(image)
     for i, curve in enumerate(per_curve):
         _draw_method2_curve(img, curve, i)
+    cv2.putText(
+        img,
+        "Method 2: yellow=projected edges → convergent tip  red=vertical l  blue=ultimate tip",
+        (12, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        YELLOW,
+        2,
+        cv2.LINE_AA,
+    )
     if output_path:
         _save_annotated(img, output_path, nm_per_pixel, config)
     return img
@@ -352,10 +538,20 @@ def annotate_method3_image(
     config: dict,
     output_path: str | None = None,
 ) -> np.ndarray:
-    """Method 3 annotated image — inscribed angle per curve."""
+    """Method 3 annotated image — inscribed angle per curve (PDF slide 4)."""
     img = _base_image(image)
     for i, curve in enumerate(per_curve):
         _draw_method3_curve(img, curve, i)
+    cv2.putText(
+        img,
+        "Method 3: cyan=fixed-D circle  yellow=rays tip->edge  theta=included angle",
+        (12, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        CYAN,
+        2,
+        cv2.LINE_AA,
+    )
     if output_path:
         _save_annotated(img, output_path, nm_per_pixel, config)
     return img

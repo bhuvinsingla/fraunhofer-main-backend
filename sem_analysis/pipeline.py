@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,8 @@ import pandas as pd
 import yaml
 
 from sem_analysis.annotation import (
+    annotate_approach3_image,
+    annotate_circular_arc_image,
     annotate_image,
     annotate_method1_image,
     annotate_method2_image,
@@ -32,6 +35,8 @@ from sem_analysis.io.image_loader import (
 from sem_analysis.roi import extract_measurement_roi
 from sem_analysis.tip_measurement import measure_all_tips, tips_to_dataframe
 from sem_analysis.methods.brainstorming import run_brainstorming_all_peaks, run_brainstorming_methods
+from sem_analysis.methods.parabola_approach2 import find_parabola_curves
+from sem_analysis.methods.openai_vlm_approach3 import run_openai_vlm_approach
 from sem_analysis.research.osculating_tip import measure_all_osculating_tips, osculating_tip_to_dict
 from sem_analysis.preprocessing import ProcessedImage, preprocess
 from sem_analysis.radius_computation import (
@@ -48,6 +53,8 @@ from sem_analysis.validation import (
     generate_validation_report,
     load_ground_truth,
 )
+
+log = logging.getLogger("sem-api.stages")
 
 
 # Canonical analysis stages — arch-first protocol (default)
@@ -158,6 +165,8 @@ class AnalysisResult:
             "annotated_research_path": self.annotated_research_path,
             "tilt_correction": self.tilt_correction,
             "pipeline_stages": self.pipeline_stages or PIPELINE_STAGES,
+            "debug_stages": (self.brainstorming_methods or {}).get("debug_stages")
+            or (self.alternative_methods or {}).get("debug_stages"),
         }
 
 
@@ -196,6 +205,9 @@ class SEMAnalysisPipeline:
         legacy_peaks = _legacy_peak_enabled(self.config)
         pipeline_stages = PIPELINE_STAGES if arch_first else PIPELINE_STAGES_LEGACY
 
+        log.info("=" * 60)
+        log.info("[STAGE 1/4 ANALYZE IMAGE] loading %s", image_path.name)
+
         # [1] Original SEM image — per-image calibration (no cross-image averaging)
         sem_image = load_image(
             image_path,
@@ -210,6 +222,22 @@ class SEMAnalysisPipeline:
 
         processed = preprocess(sem_image.data, sem_image.nm_per_pixel, self.config)
         shapes = detect_shapes(processed.data, self.config)
+
+        h, w = processed.data.shape[:2]
+        log.info(
+            "[STAGE 1/4 ANALYZE IMAGE] size=%dx%d nm/px=%.6f (raw=%.6f) shapes=%d tilt_applied=%s",
+            w,
+            h,
+            processed.nm_per_pixel,
+            getattr(sem_image, "nm_per_pixel_raw", sem_image.nm_per_pixel) or sem_image.nm_per_pixel,
+            len(shapes),
+            bool(tilt_info.get("applied")),
+        )
+        if abs(float(processed.nm_per_pixel) - 1.0) < 1e-9:
+            log.warning(
+                "[STAGE 1/4 ANALYZE IMAGE] nm/px is 1.0 — likely missing calibration. "
+                "Enter nm per pixel in the UI or Stage 2/4 (100 nm chord) will be wrong."
+            )
 
         # Legacy skyline/Harris peak + Hough path (optional; accepts border peaks)
         global_edge = None
@@ -307,18 +335,39 @@ class SEMAnalysisPipeline:
             )
             tip_rows_df = tips_to_dataframe(protocol_tips, image_id=image_path.name)
 
+            # Enrich stage 1 diagnostics for the client console
+            stages = brainstorming_methods.setdefault("debug_stages", {})
+            stages["stage1_analyze_image"] = {
+                "status": "ok",
+                "image": image_path.name,
+                "width_px": int(w),
+                "height_px": int(h),
+                "nm_per_pixel": float(processed.nm_per_pixel),
+                "n_shapes": len(shapes),
+                "calibration_warning": abs(float(processed.nm_per_pixel) - 1.0) < 1e-9,
+            }
+
             ann_base = processed.data
             method1_path = output_dir / f"{image_path.stem}_method1.png"
             method2_path = output_dir / f"{image_path.stem}_method2.png"
             method3_path = output_dir / f"{image_path.stem}_method3.png"
 
-            m1_curves = brainstorming_methods.get("fixed_distance_circle", {}).get("per_curve", [])
+            m1_ok = brainstorming_methods.get("fixed_distance_circle", {}).get("per_curve", [])
+            m1_fail = brainstorming_methods.get("fixed_distance_circle", {}).get("failed_curves", [])
+            m1_curves = list(m1_ok) + list(m1_fail)
             m2_curves = brainstorming_methods.get("projected_tip_distance", {}).get("per_curve", [])
             m3_curves = brainstorming_methods.get("inscribed_angle", {}).get("per_curve", [])
 
             annotate_method1_image(
                 ann_base, m1_curves, processed.nm_per_pixel, self.config,
                 output_path=str(method1_path),
+            )
+            log.info(
+                "[STAGE 3/4 MARK POINTS] wrote %s curves_drawn=%d (ok=%d failed=%d)",
+                method1_path.name,
+                len(m1_curves),
+                len(m1_ok),
+                len(m1_fail),
             )
             annotate_method2_image(
                 ann_base, m2_curves, processed.nm_per_pixel, self.config,
@@ -329,8 +378,85 @@ class SEMAnalysisPipeline:
                 output_path=str(method3_path),
             )
 
+            # Approach 2: vertex-form parabola curves (purple) + pink vertex
+            approach2 = find_parabola_curves(
+                ann_base, processed.nm_per_pixel, self.config
+            )
+            brainstorming_methods["approach2_parabolas"] = approach2
+            # Keep legacy key so older UI still finds results
+            brainstorming_methods["approach2_circular_arcs"] = approach2
+            a2_path = output_dir / f"{image_path.stem}_method1_approach2.png"
+            annotate_circular_arc_image(
+                ann_base,
+                approach2.get("per_curve") or [],
+                processed.nm_per_pixel,
+                self.config,
+                output_path=str(a2_path),
+            )
+            log.info(
+                "[APPROACH 2] wrote %s parabolas=%d median=%s",
+                a2_path.name,
+                approach2.get("count"),
+                approach2.get("median_radius_nm"),
+            )
+
+            # Approach 3: OpenAI contour → OpenCV refine → circle fit (tips from Method 1)
+            tip_seeds = []
+            for c in m1_ok:
+                loc = c.get("tip_point") or c.get("peak_location")
+                if loc and len(loc) >= 2:
+                    tip_seeds.append([float(loc[0]), float(loc[1])])
+            try:
+                approach3 = run_openai_vlm_approach(
+                    ann_base,
+                    processed.nm_per_pixel,
+                    self.config,
+                    tip_seeds=tip_seeds or None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("[APPROACH 3] failed (continuing without it): %s", exc)
+                approach3 = {
+                    "approach": "openai_vlm_circle_fit",
+                    "label": "Approach 3 — OpenAI peaks + contour → circle fit",
+                    "count": 0,
+                    "peak_count": 0,
+                    "per_curve": [],
+                    "failed_curves": [],
+                    "median_radius_nm": None,
+                    "mean_radius_nm": None,
+                    "std_radius_nm": None,
+                    "nm_per_pixel": processed.nm_per_pixel,
+                    "openai": {"ok": False, "error": str(exc)},
+                }
+            brainstorming_methods["approach3_openai_vlm"] = approach3
+            a3_curves = list(approach3.get("per_curve") or []) + list(
+                approach3.get("failed_curves") or []
+            )
+            a3_path = output_dir / f"{image_path.stem}_method1_approach3.png"
+            try:
+                annotate_approach3_image(
+                    ann_base,
+                    a3_curves,
+                    processed.nm_per_pixel,
+                    self.config,
+                    output_path=str(a3_path),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[APPROACH 3] annotate failed: %s", exc)
+                a3_path = output_dir / f"{image_path.stem}_method1_approach3.png"
+            log.info(
+                "[APPROACH 3] wrote %s fitted=%d mean=%s std=%s openai_ok=%s",
+                a3_path.name,
+                approach3.get("count"),
+                approach3.get("mean_radius_nm"),
+                approach3.get("std_radius_nm"),
+                (approach3.get("openai") or {}).get("ok"),
+            )
+
             annotated_method_paths = {
                 "method1": str(method1_path),
+                "method1_approach2": str(a2_path),
+                "method1_approach3": str(a3_path),
                 "method2": str(method2_path),
                 "method3": str(method3_path),
             }
@@ -352,6 +478,23 @@ class SEMAnalysisPipeline:
                 "std_radius_nm": m1.get("std"),
                 "method2_median_l_nm": m2.get("median_distance_l_nm") or m2.get("median"),
                 "n_hard_valid": brainstorming_methods.get("tip_validation", {}).get("n_accepted", 0),
+                "n_marked": m1.get("n_marked"),
+                "approach2_median_radius_nm": (
+                    brainstorming_methods.get("approach2_parabolas")
+                    or brainstorming_methods.get("approach2_circular_arcs")
+                    or {}
+                ).get("median_radius_nm"),
+                "approach2_count": (
+                    brainstorming_methods.get("approach2_parabolas")
+                    or brainstorming_methods.get("approach2_circular_arcs")
+                    or {}
+                ).get("count"),
+                "approach3_median_radius_nm": (
+                    brainstorming_methods.get("approach3_openai_vlm") or {}
+                ).get("median_radius_nm"),
+                "approach3_count": (
+                    brainstorming_methods.get("approach3_openai_vlm") or {}
+                ).get("count"),
             }
             primary_method = "fixed_distance_circle"
         else:
@@ -520,6 +663,53 @@ class SEMAnalysisPipeline:
                     base[f"{label}_nm"] = rd.get("radius_nm")
                 rows.append(base)
             pd.DataFrame(rows).to_csv(output_dir / f"{stem}_method1_radii.csv", index=False)
+
+        a2 = (
+            bs.get("approach2_parabolas") or bs.get("approach2_circular_arcs") or {}
+        ).get("per_curve", [])
+        if a2:
+            rows = [
+                {
+                    "curve_id": c.get("curve_id", c.get("peak_id")),
+                    "vertex_x": (c.get("vertex") or c.get("peak_location") or [None, None])[0],
+                    "vertex_y": (c.get("vertex") or c.get("peak_location") or [None, None])[1],
+                    "a": c.get("a"),
+                    "h": c.get("h"),
+                    "k": c.get("k"),
+                    "radius_px": c.get("radius_px"),
+                    "radius_nm": c.get("radius_nm"),
+                    "rel_residual": c.get("rel_residual"),
+                    "residual_px": c.get("residual_px"),
+                    "equation": c.get("equation"),
+                }
+                for c in a2
+            ]
+            pd.DataFrame(rows).to_csv(
+                output_dir / f"{stem}_method1_approach2_radii.csv", index=False
+            )
+
+        a3 = (bs.get("approach3_openai_vlm") or {}).get("per_curve", [])
+        if a3:
+            rows = [
+                {
+                    "peak_id": c.get("peak_id"),
+                    "peak_x": (c.get("peak_location") or [None, None])[0],
+                    "peak_y": (c.get("peak_location") or [None, None])[1],
+                    "radius_nm": c.get("radius_nm"),
+                    "radius_px": c.get("radius_px"),
+                    "center_x": (c.get("center") or [None, None])[0],
+                    "center_y": (c.get("center") or [None, None])[1],
+                    "fit_method": c.get("fit_method"),
+                    "fit_residual_px": c.get("fit_residual_px"),
+                    "vlm_confidence": c.get("vlm_confidence"),
+                    "source": c.get("source"),
+                    "valid": c.get("valid"),
+                }
+                for c in a3
+            ]
+            pd.DataFrame(rows).to_csv(
+                output_dir / f"{stem}_method1_approach3_radii.csv", index=False
+            )
 
         m2 = bs.get("projected_tip_distance", {}).get("per_curve", [])
         if m2:

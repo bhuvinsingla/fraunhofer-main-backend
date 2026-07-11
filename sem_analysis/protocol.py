@@ -10,11 +10,12 @@ DEFAULT_PROTOCOL = {
     "approved": False,
     "approved_by": None,
     "notes": (
-        "Proposed defaults pending client approval of Method 1 l, "
-        "Method 2 fit band, and Method 3 circle diameter D."
+        "Method 1: apex → drop l = 50 nm (vertical) → left/right edge intersections "
+        "→ circumcircle radius. Small R = sharper tip; large R = blunt/rounded. "
+        "Method 2 fit band and Method 3 D pending client approval."
     ),
-    "method1_distances_nm": [25, 50, 100, 200],
-    "method1_primary_nm": 100,
+    "method1_distances_nm": [50],
+    "method1_primary_nm": 50,
     "method2_fit_band_nm": [50, 200],
     "method3_circle_diameter_nm": 100,
 }
@@ -23,7 +24,7 @@ DEFAULT_PROTOCOL = {
 def get_protocol(config: dict | None = None) -> dict[str, Any]:
     """Return merged protocol block from config."""
     proto = {**DEFAULT_PROTOCOL, **((config or {}).get("protocol") or {})}
-    proto["method1_distances_nm"] = list(proto.get("method1_distances_nm") or [25, 50, 100, 200])
+    proto["method1_distances_nm"] = list(proto.get("method1_distances_nm") or [100])
     proto["method2_fit_band_nm"] = list(proto.get("method2_fit_band_nm") or [50, 200])
     proto["method1_primary_nm"] = float(proto.get("method1_primary_nm", 100))
     proto["method3_circle_diameter_nm"] = float(proto.get("method3_circle_diameter_nm", 100))

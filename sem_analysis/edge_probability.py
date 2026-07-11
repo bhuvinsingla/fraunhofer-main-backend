@@ -18,6 +18,41 @@ class EdgeProbabilityMaps:
     gradient: np.ndarray
 
 
+def _as_gray_u8(image: np.ndarray) -> np.ndarray:
+    """Force a contiguous CV_8U single-channel image for Canny / CLAHE / bilateral."""
+    arr = np.asarray(image)
+    if arr.ndim == 3:
+        if arr.shape[2] == 1:
+            arr = arr[:, :, 0]
+        elif arr.dtype == np.uint8:
+            arr = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+        else:
+            # Float / uint16 color → uint8 first, then gray
+            u8 = _scale_to_u8(arr)
+            arr = cv2.cvtColor(u8, cv2.COLOR_BGR2GRAY)
+            return np.ascontiguousarray(arr, dtype=np.uint8)
+    if arr.dtype != np.uint8:
+        arr = _scale_to_u8(arr)
+        if arr.ndim == 3:
+            arr = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+    return np.ascontiguousarray(arr, dtype=np.uint8)
+
+
+def _scale_to_u8(image: np.ndarray) -> np.ndarray:
+    arr = np.asarray(image)
+    if arr.dtype == np.uint8:
+        return arr
+    if arr.dtype == np.uint16:
+        return (arr / 256).astype(np.uint8)
+    f = arr.astype(np.float32)
+    mx = float(np.nanmax(f)) if f.size else 0.0
+    if mx <= 1.0 + 1e-6:
+        return (np.clip(f, 0, 1) * 255).astype(np.uint8)
+    if mx <= 255.0 + 1e-3:
+        return np.clip(f, 0, 255).astype(np.uint8)
+    return (np.clip(f / mx, 0, 1) * 255).astype(np.uint8)
+
+
 def preprocess_sem(image: np.ndarray) -> EdgeProbabilityMaps:
     """
     CLAHE → bilateral → auto-Canny + Scharr magnitude.
@@ -28,20 +63,13 @@ def preprocess_sem(image: np.ndarray) -> EdgeProbabilityMaps:
     if image is None or image.size == 0:
         raise ValueError("Invalid SEM image.")
 
-    if image.ndim == 3:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = image.copy()
-        if gray.dtype != np.uint8:
-            if gray.max() <= 1.0:
-                gray = (np.clip(gray, 0, 1) * 255).astype(np.uint8)
-            else:
-                gray = np.clip(gray, 0, 255).astype(np.uint8)
+    gray = _as_gray_u8(image)
 
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
 
     denoised = cv2.bilateralFilter(enhanced, d=7, sigmaColor=40, sigmaSpace=40)
+    denoised = np.ascontiguousarray(denoised, dtype=np.uint8)
 
     median = float(np.median(denoised))
     lower = int(max(0, 0.66 * median))

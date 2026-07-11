@@ -59,14 +59,76 @@ def to_grayscale_bgr(image: np.ndarray) -> np.ndarray:
 
 
 def crop_zeiss_info_bar(image: np.ndarray, crop_ratio: float = 0.08) -> tuple[np.ndarray, int]:
-    """Remove Zeiss SEM information / scale-bar area from the bottom of the image."""
-    if crop_ratio <= 0:
-        return image, 0
+    """
+    Remove Zeiss SEM information / scale-bar area from the bottom of the image.
+
+    Uses a dynamic 5-row window-vs-window step detector on row-wise means near
+    the bottom: finds the large intensity step that marks the start of the dark
+    info bar (avoids fixed-ratio crops when the jump is spread across rows).
+    Falls back to ``crop_ratio`` when no clear step is found.
+    """
     h = image.shape[0]
-    crop_px = int(h * crop_ratio)
-    if crop_px < 1 or crop_px >= h - 10:
+    if h < 40:
         return image, 0
-    return image[: h - crop_px, :], crop_px
+
+    # Work on grayscale means
+    if image.ndim == 3:
+        gray = cv2.cvtColor(
+            image if image.dtype == np.uint8 else np.clip(image, 0, 255).astype(np.uint8),
+            cv2.COLOR_BGR2GRAY,
+        )
+    else:
+        gray = image
+        if gray.dtype != np.uint8:
+            g = gray.astype(np.float32)
+            mx = float(np.nanmax(g)) if g.size else 1.0
+            gray = (
+                (np.clip(g, 0, 1) * 255).astype(np.uint8)
+                if mx <= 1.0 + 1e-6
+                else np.clip(g, 0, 255).astype(np.uint8)
+            )
+
+    # Search only in the bottom portion of the frame
+    search_frac = max(float(crop_ratio) if crop_ratio and crop_ratio > 0 else 0.20, 0.12)
+    search_frac = min(search_frac, 0.45)
+    y0 = int(h * (1.0 - search_frac))
+    row_means = gray[y0:, :].astype(np.float64).mean(axis=1)
+    n = len(row_means)
+    if n < 20:
+        if crop_ratio and crop_ratio > 0:
+            crop_px = int(h * crop_ratio)
+            if 1 <= crop_px < h - 10:
+                return image[: h - crop_px, :], crop_px
+        return image, 0
+
+    # 5-row window-vs-window: compare mean of rows [i:i+5] vs [i+5:i+10]
+    win = 5
+    best_i = None
+    best_step = 0.0
+    for i in range(0, n - 2 * win):
+        upper = float(np.mean(row_means[i : i + win]))
+        lower = float(np.mean(row_means[i + win : i + 2 * win]))
+        # Info bar is typically darker → upper (image) brighter than lower (bar)
+        step = upper - lower
+        if step > best_step:
+            best_step = step
+            best_i = i
+
+    # Require a meaningful jump (noise-resistant threshold)
+    min_step = max(8.0, 0.08 * float(np.ptp(row_means) + 1e-6))
+    if best_i is not None and best_step >= min_step:
+        # Crop starts at the beginning of the lower (darker) window
+        crop_start_local = best_i + win
+        crop_rows = h - (y0 + crop_start_local)
+        if 4 <= crop_rows < h - 10:
+            return image[: h - crop_rows, :], int(crop_rows)
+
+    # Fallback: fixed ratio (or no crop)
+    if crop_ratio and crop_ratio > 0:
+        crop_px = int(h * crop_ratio)
+        if 1 <= crop_px < h - 10:
+            return image[: h - crop_px, :], crop_px
+    return image, 0
 
 
 def apply_clahe(

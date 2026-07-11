@@ -1,7 +1,20 @@
-"""Method 1 — fixed-distance inscribed circle with local tip axis."""
+"""Method 1 — fixed-distance inscribed circle (vertical drop + horizontal chord).
+
+Procedure (primary l = 50 nm):
+  1. Find the tip apex (upper blue dot) — the highest point of the tip.
+  2. Move straight DOWN a fixed vertical distance l (default 50 nm).
+  3. Draw a HORIZONTAL scan line at that height; mark left/right edge crossings.
+  4. Fit a circle through apex + left + right; that radius is the tip radius.
+
+All geometry is computed directly in image coordinates: l is a true vertical
+distance and the chord is horizontal (no rotation to a local tip axis).
+
+Interpretation: small radius = sharper tip; large radius = more rounded / blunt.
+"""
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -9,11 +22,10 @@ import numpy as np
 from sem_analysis.edge_geometry import (
     circumcircle_center,
     circumcircle_radius,
-    inverse_rotate,
-    local_symmetry_axis,
-    rotate_to_axis,
     stability_ratio,
 )
+
+log = logging.getLogger("sem-api.stages")
 
 
 @dataclass
@@ -29,6 +41,7 @@ class Method1Result:
     intersection_left: tuple[float, float] | None
     intersection_right: tuple[float, float] | None
     scan_line: list[float] = field(default_factory=list)
+    vertical_l_line: list[float] = field(default_factory=list)
     stability_s: float | None = None
     valid: bool = False
     rejection_reason: str | None = None
@@ -58,11 +71,17 @@ def measure_method1_at_l(
     tip_id: int = 0,
 ) -> Method1Result:
     """
-    Align tip to local symmetry axis, take cross-section at depth l,
-    fit circumcircle through apex + left/right intersections.
+    Drop a fixed VERTICAL distance l below the apex, draw a HORIZONTAL chord,
+    fit the circumcircle through apex + left/right edge crossings.
+
+    All coordinates are image coordinates (y increases downward):
+      apex        = highest point (top blue dot)
+      y_scan      = apex_y + l_px
+      left/right  = crossings of each branch with the horizontal line y_scan
     """
     label = f"R{int(round(distance_l_nm))}"
-    tip = (float(apex[0]), float(apex[1]))
+    apex_x, apex_y = float(apex[0]), float(apex[1])
+    tip = (apex_x, apex_y)
     base = Method1Result(
         tip_id=tip_id,
         label=label,
@@ -81,64 +100,75 @@ def measure_method1_at_l(
         base.rejection_reason = "invalid_scale"
         return base
 
-    axis = local_symmetry_axis(left, right, apex)
-    all_pts = np.vstack([np.asarray(apex).reshape(1, 2), left, right])
-    local_pts, R, apex_arr = rotate_to_axis(all_pts, apex, axis)
-    # In local frame apex is at origin; +Y along tip axis
-    n_left = len(left)
-    local_left = local_pts[1 : 1 + n_left]
-    local_right = local_pts[1 + n_left :]
-
     l_px = distance_l_nm / nm_per_px
-    # Cross-section perpendicular to axis at depth l_px along +Y
-    y_scan = l_px
+    # Move straight down from the apex by the fixed vertical distance l
+    y_scan = apex_y + l_px
 
-    left_xs = _intersect_x_at_y(local_left, y_scan)
-    right_xs = _intersect_x_at_y(local_right, y_scan)
-    if not left_xs or not right_xs:
+    # Horizontal line intersections with each branch (image coords)
+    left_xs = _intersect_x_at_y(left, y_scan)
+    right_xs = _intersect_x_at_y(right, y_scan)
+    log.info(
+        "[STAGE 2/4 DETECT POINTS] tip_id=%s l=%.1fnm (%.2fpx) apex=(%.1f,%.1f) "
+        "y_scan=%.2f left_xs=%s right_xs=%s n_left=%d n_right=%d",
+        tip_id,
+        distance_l_nm,
+        l_px,
+        apex_x,
+        apex_y,
+        y_scan,
+        left_xs,
+        right_xs,
+        len(left),
+        len(right),
+    )
+
+    # Crossings on the correct side of the apex
+    left_cands = [x for x in left_xs if x < apex_x]
+    right_cands = [x for x in right_xs if x > apex_x]
+    if not left_cands or not right_cands:
         base.rejection_reason = "no_intersection"
+        log.warning(
+            "[STAGE 2/4 DETECT POINTS] tip_id=%s no_intersection at y_scan=%.2f "
+            "(branch too short for this nm/px, or edges missing)",
+            tip_id,
+            y_scan,
+        )
         return base
-    if len(left_xs) > 2 or len(right_xs) > 2:
-        # Ambiguous — take outermost unique pair carefully
-        pass
 
-    x_l = min(left_xs)
-    x_r = max(right_xs)
-    if x_l >= 0 or x_r <= 0:
-        # Both on same side of axis
-        if not (x_l < 0 < x_r):
-            base.rejection_reason = "intersections_same_side"
-            return base
+    # Pick the crossing on each side closest to the apex (inner blade edge),
+    # robust to noisy multi-crossings farther out along the flank.
+    x_l = max(left_cands)
+    x_r = min(right_cands)
+    if not (x_l < apex_x < x_r):
+        base.rejection_reason = "intersections_same_side"
+        return base
 
-    p1_local = np.array([0.0, 0.0])
-    p2_local = np.array([x_l, y_scan])
-    p3_local = np.array([x_r, y_scan])
+    p1 = np.array([apex_x, apex_y])
+    p2 = np.array([x_l, y_scan])
+    p3 = np.array([x_r, y_scan])
 
     try:
-        r_px = circumcircle_radius(p1_local, p2_local, p3_local)
-        cx_l, cy_l = circumcircle_center(p1_local, p2_local, p3_local)
+        r_px = circumcircle_radius(p1, p2, p3)
+        cx, cy = circumcircle_center(p1, p2, p3)
     except ValueError:
         base.rejection_reason = "collinear_or_unstable"
         return base
 
-    # Circle should sit between branches (center near axis, below apex)
-    if cy_l < -1e-3:
+    # Circle center should sit below the apex (between the branches)
+    if cy < apex_y - 1e-3:
         base.rejection_reason = "circle_not_between_branches"
         return base
-
-    # Map back to image coords
-    local_tri = np.array([p1_local, p2_local, p3_local, [cx_l, cy_l]])
-    world = inverse_rotate(local_tri, R, apex_arr)
-    p1, p2, p3, center = world[0], world[1], world[2], world[3]
 
     r_nm = r_px * nm_per_px
     base.radius_px = float(r_px)
     base.radius_nm = float(r_nm)
     base.projected_radius_nm = float(r_nm)  # tilt not blindly corrected
-    base.center = (float(center[0]), float(center[1]))
-    base.intersection_left = (float(p2[0]), float(p2[1]))
-    base.intersection_right = (float(p3[0]), float(p3[1]))
-    base.scan_line = [float(p2[0]), float(p2[1]), float(p3[0]), float(p3[1])]
+    base.center = (float(cx), float(cy))
+    base.intersection_left = (float(x_l), float(y_scan))
+    base.intersection_right = (float(x_r), float(y_scan))
+    base.scan_line = [float(x_l), float(y_scan), float(x_r), float(y_scan)]
+    # Vertical red "l" straight down from apex to the scan-line height
+    base.vertical_l_line = [apex_x, apex_y, apex_x, float(y_scan)]
     base.valid = True
     return base
 
@@ -188,6 +218,7 @@ def method1_to_dict(result: Method1Result) -> dict:
         "intersection_left": list(result.intersection_left) if result.intersection_left else None,
         "intersection_right": list(result.intersection_right) if result.intersection_right else None,
         "scan_line": result.scan_line,
+        "vertical_l_line": result.vertical_l_line,
         "stability_s": result.stability_s,
         "valid": result.valid,
         "rejection_reason": result.rejection_reason,

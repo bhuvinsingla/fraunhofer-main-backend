@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
 import time
 import uuid
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load .env before any OpenAI / OCR code reads secrets
+BACKEND_ROOT = Path(__file__).resolve().parent
+load_dotenv(BACKEND_ROOT / ".env", override=False)
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,7 +31,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("sem-api")
 
-BACKEND_ROOT = Path(__file__).resolve().parent
 UPLOAD_DIR = BACKEND_ROOT / "uploads"
 SAMPLE_IMAGE = BACKEND_ROOT / "data" / "sample" / "synthetic_tip.png"
 SAMPLE_GROUND_TRUTH = BACKEND_ROOT / "data" / "sample" / "synthetic_tip_ground_truth.csv"
@@ -41,6 +47,11 @@ app.add_middleware(
 )
 
 pipeline = SEMAnalysisPipeline()
+
+if os.getenv("OPENAI_API_KEY"):
+    log.info("OPENAI_API_KEY loaded — will use OpenAI Vision only for SEM footer OCR")
+else:
+    log.info("OPENAI_API_KEY not set — SEM footer OCR uses RapidOCR / local engines only")
 
 
 @app.middleware("http")
@@ -82,10 +93,14 @@ def _serialize_result(result, job_id: str) -> dict:
         "radii": f"{base}/{stem}_radii.csv",
         "tips": f"{base}/{stem}_tips.csv",
         "method1": f"{base}/{stem}_method1.png",
+        "method1_approach2": f"{base}/{stem}_method1_approach2.png",
+        "method1_approach3": f"{base}/{stem}_method1_approach3.png",
         "method2": f"{base}/{stem}_method2.png",
         "method3": f"{base}/{stem}_method3.png",
         "whiteboard": f"{base}/{stem}_whiteboard.png",
         "method1_csv": f"{base}/{stem}_method1_radii.csv",
+        "method1_approach2_csv": f"{base}/{stem}_method1_approach2_radii.csv",
+        "method1_approach3_csv": f"{base}/{stem}_method1_approach3_radii.csv",
         "method2_csv": f"{base}/{stem}_method2_radii.csv",
         "method3_csv": f"{base}/{stem}_method3_radii.csv",
         "blade_value_csv": f"{base}/{stem}_blade_value.csv",
@@ -111,17 +126,95 @@ def _log_result_summary(job_id: str, result) -> None:
         result.tip_condition or "n/a",
     )
 
+    bs = result.brainstorming_methods or {}
+    fdc = bs.get("fixed_distance_circle") or {}
+    median_r = fdc.get("median_radius_nm")
+    if median_r is None:
+        median_r = fdc.get("median")
+    if median_r is None:
+        median_r = fdc.get("mean_radius_nm") or fdc.get("mean")
+    tip = result.tip_condition or "n/a"
+    if tip == "sharp":
+        tip_note = "Small radius = sharper tip"
+    elif tip == "blunt":
+        tip_note = "Large radius = more rounded or blunt tip"
+    elif tip == "moderate":
+        tip_note = "Intermediate tip radius"
+    else:
+        tip_note = ""
+
+    cal = getattr(result, "calibration", None) or {}
+    log.info(
+        "Job %s | calibration nm/px=%s source=%s",
+        job_id,
+        getattr(result, "nm_per_pixel", None),
+        cal.get("calibration_source"),
+    )
+    log.info(
+        "Job %s | Fixed distance inscribed circle | median R100=%s nm | tip=%s | %s | n=%s failed=%s",
+        job_id,
+        f"{median_r:.4f}" if median_r is not None else "n/a",
+        tip,
+        tip_note,
+        fdc.get("count") if fdc.get("count") is not None else fdc.get("n"),
+        len(fdc.get("failed_curves") or []),
+    )
+    for curve in fdc.get("per_curve") or []:
+        log.info(
+            "Job %s | tip_id=%s R100=%s nm valid=%s tip_point=%s left=%s right=%s",
+            job_id,
+            curve.get("peak_id") or curve.get("tip_id"),
+            curve.get("radius_nm"),
+            curve.get("valid"),
+            curve.get("tip_point") or curve.get("peak_location"),
+            curve.get("intersection_left"),
+            curve.get("intersection_right"),
+        )
+    for curve in fdc.get("failed_curves") or []:
+        log.info(
+            "Job %s | FAILED tip_id=%s reason=%s radii_by_l=%s",
+            job_id,
+            curve.get("peak_id") or curve.get("tip_id"),
+            curve.get("rejection_reason") or curve.get("method1_rejection_reason"),
+            {
+                lab: (rd or {}).get("rejection_reason")
+                for lab, rd in (curve.get("radii_by_l") or {}).items()
+            },
+        )
+
+    stages = bs.get("debug_stages") or {}
+    if stages:
+        log.info("Job %s | debug_stages keys=%s", job_id, list(stages.keys()))
+        for key, val in stages.items():
+            log.info("Job %s | %s → %s", job_id, key, json.dumps(val, default=str)[:800])
+
+
+def _write_manual_calibration(image_path: Path, nm_per_pixel: float) -> Path:
+    cal_path = image_path.parent / f"{image_path.stem}_calibration.json"
+    payload = {
+        "nm_per_pixel": float(nm_per_pixel),
+        "calibration_source": "manual_override",
+    }
+    with open(cal_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    log.info("Wrote manual calibration %s (nm/px=%s)", cal_path.name, nm_per_pixel)
+    return cal_path
+
 
 def _run_analysis(
     image_path: Path,
     output_dir: Path,
     ground_truth_path: Path | None = None,
     protocol_overrides: dict | None = None,
+    nm_per_pixel: float | None = None,
 ) -> dict:
     job_id = output_dir.name
     log.info("Job %s | starting pipeline on %s", job_id, image_path.name)
     if ground_truth_path:
         log.info("Job %s | ground truth: %s", job_id, ground_truth_path.name)
+
+    if nm_per_pixel is not None and nm_per_pixel > 0:
+        _write_manual_calibration(image_path, nm_per_pixel)
 
     cfg = apply_protocol_overrides(pipeline.config, protocol_overrides)
     if protocol_overrides:
@@ -178,6 +271,7 @@ async def analyze(
     method3_circle_diameter_nm: float | None = None,
     protocol_approved: bool | None = None,
     protocol_approved_by: str | None = None,
+    nm_per_pixel: float | None = None,
 ) -> dict:
     if not image.filename:
         log.warning("Analyze rejected: no image provided")
@@ -222,7 +316,13 @@ async def analyze(
             protocol_approved=protocol_approved,
             protocol_approved_by=protocol_approved_by,
         )
-        return _run_analysis(image_path, job_path, gt_path, overrides or None)
+        return _run_analysis(
+            image_path,
+            job_path,
+            gt_path,
+            overrides or None,
+            nm_per_pixel=nm_per_pixel,
+        )
     except ResizedImageError as exc:
         log.warning("Job %s | resized image rejected: %s", job_id, exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc

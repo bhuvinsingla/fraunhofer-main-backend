@@ -13,9 +13,26 @@ import numpy as np
 
 
 def _to_u8(image: np.ndarray) -> np.ndarray:
-    if image.dtype == np.uint8:
-        return image
-    return (np.clip(image, 0, 1) * 255).astype(np.uint8)
+    arr = np.asarray(image)
+    if arr.dtype == np.uint8:
+        out = arr
+    elif arr.dtype == np.uint16:
+        out = (arr / 256).astype(np.uint8)
+    else:
+        f = arr.astype(np.float32)
+        mx = float(np.nanmax(f)) if f.size else 0.0
+        if mx <= 1.0 + 1e-6:
+            out = (np.clip(f, 0, 1) * 255).astype(np.uint8)
+        elif mx <= 255.0 + 1e-3:
+            out = np.clip(f, 0, 255).astype(np.uint8)
+        else:
+            out = (np.clip(f / max(mx, 1e-6), 0, 1) * 255).astype(np.uint8)
+    if out.ndim == 3:
+        if out.shape[2] == 1:
+            out = out[:, :, 0]
+        else:
+            out = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
+    return np.ascontiguousarray(out, dtype=np.uint8)
 
 
 def _binarize_magnitude(mag: np.ndarray, percentile: float = 85.0) -> np.ndarray:
