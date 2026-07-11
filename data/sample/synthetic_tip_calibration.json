@@ -1,0 +1,8 @@
+{
+  "nm_per_pixel": 2.0,
+  "true_radius_nm": 30.0,
+  "tip_center": [
+    256,
+    128
+  ]
+}

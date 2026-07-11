@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sem-tip-radius"
+version = "1.0.0"
+description = "SEM image analysis pipeline for tip radius measurement"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "opencv-python>=4.8.0",
+    "scikit-image>=0.21.0",
+    "scikit-learn>=1.3.0",
+    "Pillow>=10.0.0",
+    "tifffile>=2023.7.0",
+    "matplotlib>=3.7.0",
+    "pandas>=2.0.0",
+    "PyYAML>=6.0",
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+    "python-multipart>=0.0.9",
+]
+
+[project.scripts]
+sem-analyze = "sem_analysis.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
