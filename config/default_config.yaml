@@ -20,6 +20,8 @@ calibration:
 
 preprocessing:
   border_margin_px: 10
+  # Keep top of frame (0) so Method 2 can extrapolate above near-top serrations
+  top_margin_px: 0
   info_bar_crop_ratio: 0.15   # fallback ratio; window-vs-window detector preferred
   denoise_method: "bilateral"
   clahe_clip_limit: 2.0
@@ -205,6 +207,7 @@ tip_validation:
   method1_stability_threshold: 0.20
   method2_min_cross: 0.08
   method2_max_l_nm: 250.0        # reject far-away projected apexes (runaway flanks)
+  method2_min_flank_points: 3    # relaxed; shorter bands tried automatically
 
 shape_detection:
   adaptive_block_size: 11
@@ -246,13 +249,17 @@ protocol:
   approved: false
   approved_by: null
   notes: >
-    Method 1 (primary): apex → drop l = 50 nm (vertical) → horizontal chord at
-    left/right edges → circumcircle through three points = tip radius. Small R =
-    sharper; large R = more rounded/blunt. Method 2 fit band and Method 3 D pending
-    client approval.
+    Method 1 (primary): apex T → drop fixed vertical l → horizontal chord at
+    P_L/P_R → circumcircle through T,P_L,P_R = tip radius R. Small R = sharper;
+    large R = blunt. Method 2: flank lines → P_proj → vertical distance l to T.
+    Method 3 (Interpretation A, locked): circle of diameter D at tip; θ = angle
+    between rays T→P_L and T→P_R (not external tangents above the circle).
+  # Method 1: fixed VERTICAL distance l below tip (nm) — held constant across samples
   method1_distances_nm: [50]
   method1_primary_nm: 50
+  # Method 2: depth band (nm below tip) used to fit straight flank segments
   method2_fit_band_nm: [50, 200]
+  # Method 3: fixed circle DIAMETER D at tip (nm) — not the same symbol as Method 1's l
   method3_circle_diameter_nm: 100
   method3_definition: "interpretation_A_circle_at_apex"
 
@@ -269,8 +276,9 @@ measurement_methods:
     primary_nm: 50
   projected_tip_distance:
     fit_band_nm: [50, 200]
-    min_flank_points: 4
+    min_flank_points: 3
   inscribed_angle:
+    # Fixed diameter D (nm); Interpretation A = rays tip→circle–edge intersections
     circle_diameter_nm: 100
     tangent_from: "apex_to_intersections"
     tangent_length: 80.0

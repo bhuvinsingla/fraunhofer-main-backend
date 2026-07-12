@@ -13,8 +13,11 @@ import pandas as pd
 import yaml
 
 from sem_analysis.annotation import (
+    annotate_approach3_d_r_reference_image,
     annotate_approach3_fixed_distance_image,
     annotate_approach3_image,
+    annotate_approach3_inscribed_angle_image,
+    annotate_approach3_projected_tip_image,
     annotate_circular_arc_image,
     annotate_image,
     annotate_method1_image,
@@ -23,7 +26,9 @@ from sem_analysis.annotation import (
     annotate_research_image,
     annotate_validated_tips,
     annotate_whiteboard_image,
+    build_d_r_reference_curves,
     match_fixed_distance_to_tips,
+    match_geometry_to_tips,
 )
 from sem_analysis.deduction import FilteredDetection, apply_deduction
 from sem_analysis.edge_detection import EdgePeakResult, detect_edges_and_peaks, detect_serration_peaks_global
@@ -57,6 +62,126 @@ from sem_analysis.validation import (
 )
 
 log = logging.getLogger("sem-api.stages")
+
+
+def _method1_curves_to_radius_results(
+    curves: list[dict],
+    nm_per_pixel: float,
+) -> list[RadiusResult]:
+    """Build RadiusResult list from Method 1 per_curve for ground-truth alignment."""
+    out: list[RadiusResult] = []
+    for c in curves or []:
+        loc = c.get("peak_location") or c.get("tip_point")
+        r_nm = (
+            c.get("projected_radius_nm")
+            if c.get("projected_radius_nm") is not None
+            else c.get("radius_nm")
+        )
+        if loc is None or r_nm is None:
+            continue
+        r_px = c.get("radius_px")
+        if r_px is None and nm_per_pixel > 0:
+            r_px = float(r_nm) / nm_per_pixel
+        out.append(
+            RadiusResult(
+                peak_id=int(c.get("peak_id", c.get("tip_id", len(out)))),
+                shape_id=0,
+                radius_px=float(r_px or 0.0),
+                radius_nm=float(r_nm),
+                radius_angstrom=float(r_nm) * 10.0,
+                fit_residual=float(c.get("fit_residual_px") or 0.0),
+                center=(float(loc[0]), float(loc[1])),
+                method="fixed_distance_circle",
+                peak_location=(float(loc[0]), float(loc[1])),
+            )
+        )
+    return out
+
+
+def _reconcile_method1_vs_vision(
+    m1_curves: list[dict],
+    a3_curves: list[dict],
+    *,
+    max_dist_px: float = 40.0,
+    high_delta_pct: float = 25.0,
+) -> dict:
+    """Per-peak Δ between fixed-distance R and OpenAI Vision R."""
+    rows: list[dict] = []
+    a3_pts = []
+    for c in a3_curves or []:
+        loc = c.get("peak_location") or c.get("tip_point")
+        r = c.get("radius_nm")
+        if loc is None or r is None:
+            continue
+        a3_pts.append(
+            (float(loc[0]), float(loc[1]), float(r), c.get("peak_id"), c.get("vlm_confidence"))
+        )
+
+    for c in m1_curves or []:
+        loc = c.get("peak_location") or c.get("tip_point")
+        r1 = (
+            c.get("projected_radius_nm")
+            if c.get("projected_radius_nm") is not None
+            else c.get("radius_nm")
+        )
+        if loc is None or r1 is None:
+            continue
+        x, y = float(loc[0]), float(loc[1])
+        best = None
+        best_d = float("inf")
+        for ax, ay, ar, aid, conf in a3_pts:
+            d = float(np.hypot(ax - x, ay - y))
+            if d < best_d:
+                best_d = d
+                best = (ar, aid, conf)
+        if best is None or best_d > max_dist_px:
+            rows.append(
+                {
+                    "peak_id": c.get("peak_id"),
+                    "method1_R_nm": float(r1),
+                    "vision_R_nm": None,
+                    "delta_nm": None,
+                    "delta_pct": None,
+                    "match_dist_px": None if best is None else round(best_d, 2),
+                    "flag": "no_vision_match",
+                    "note": "No nearby OpenAI Vision radius for this tip.",
+                }
+            )
+            continue
+        ar, aid, conf = best
+        delta = float(r1) - float(ar)
+        denom = max(abs(float(ar)), abs(float(r1)), 1e-6)
+        delta_pct = 100.0 * abs(delta) / denom
+        flag = "ok"
+        note = "Methods agree within tolerance."
+        if delta_pct >= high_delta_pct:
+            flag = "high_disagreement"
+            note = (
+                "Systematic disagreement — check neighboring-peak crowding on the "
+                "fixed-distance chord, or Vision contour including an adjacent tip."
+            )
+        rows.append(
+            {
+                "peak_id": c.get("peak_id"),
+                "vision_peak_id": aid,
+                "method1_R_nm": round(float(r1), 3),
+                "vision_R_nm": round(float(ar), 3),
+                "delta_nm": round(delta, 3),
+                "delta_pct": round(delta_pct, 1),
+                "match_dist_px": round(best_d, 2),
+                "vlm_confidence": conf,
+                "flag": flag,
+                "note": note,
+            }
+        )
+
+    n_high = sum(1 for r in rows if r.get("flag") == "high_disagreement")
+    return {
+        "per_peak": rows,
+        "n_compared": sum(1 for r in rows if r.get("vision_R_nm") is not None),
+        "n_high_disagreement": n_high,
+        "threshold_pct": high_delta_pct,
+    }
 
 
 # Canonical analysis stages — arch-first protocol (default)
@@ -328,7 +453,11 @@ class SEMAnalysisPipeline:
 
         if arch_first or run_alternative_methods:
             border_m = int(self.config.get("preprocessing", {}).get("border_margin_px", 10))
-            roi = extract_measurement_roi(sem_image.data, border_margin_px=border_m)
+            top_m = self.config.get("preprocessing", {}).get("top_margin_px", 0)
+            top_m = int(top_m) if top_m is not None else 0
+            roi = extract_measurement_roi(
+                sem_image.data, border_margin_px=border_m, top_margin_px=top_m
+            )
             protocol_tips, brainstorming_methods = measure_all_tips(
                 roi,
                 processed.nm_per_pixel,
@@ -479,6 +608,100 @@ class SEMAnalysisPipeline:
             except Exception as exc:  # noqa: BLE001
                 log.warning("[APPROACH 3] fixed-distance annotate failed: %s", exc)
                 a3_fd_path = output_dir / f"{image_path.stem}_method1_approach3_fixed_distance.png"
+
+            # Projected tip distance on OpenAI Vision tips
+            a3_pt_path = output_dir / f"{image_path.stem}_method1_approach3_projected_tip.png"
+            a3_pt_curves = match_geometry_to_tips(
+                a3_curves, m2_curves, miss_reason="no_projected_tip_match"
+            )
+            brainstorming_methods["approach3_projected_tip"] = {
+                "approach": "openai_tips_projected_tip_distance",
+                "label": "OpenAI tips + distance from projected tip",
+                "count": sum(
+                    1 for c in a3_pt_curves if c.get("distance_l_nm") is not None
+                ),
+                "per_curve": a3_pt_curves,
+            }
+            pt_vals = [
+                float(c["distance_l_nm"])
+                for c in a3_pt_curves
+                if c.get("distance_l_nm") is not None
+            ]
+            if pt_vals:
+                brainstorming_methods["approach3_projected_tip"]["median_distance_l_nm"] = float(
+                    np.median(pt_vals)
+                )
+            try:
+                annotate_approach3_projected_tip_image(
+                    ann_base,
+                    a3_pt_curves,
+                    processed.nm_per_pixel,
+                    self.config,
+                    output_path=str(a3_pt_path),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[APPROACH 3] projected-tip annotate failed: %s", exc)
+                a3_pt_path = output_dir / f"{image_path.stem}_method1_approach3_projected_tip.png"
+
+            # Inscribed angle on OpenAI Vision tips
+            a3_ia_path = output_dir / f"{image_path.stem}_method1_approach3_inscribed_angle.png"
+            a3_ia_curves = match_geometry_to_tips(
+                a3_curves, m3_curves, miss_reason="no_inscribed_angle_match"
+            )
+            brainstorming_methods["approach3_inscribed_angle"] = {
+                "approach": "openai_tips_inscribed_angle",
+                "label": "OpenAI tips + inscribed angle (fixed diameter)",
+                "count": sum(
+                    1 for c in a3_ia_curves if c.get("angle_degrees") is not None
+                ),
+                "per_curve": a3_ia_curves,
+            }
+            ia_vals = [
+                float(c["angle_degrees"])
+                for c in a3_ia_curves
+                if c.get("angle_degrees") is not None
+            ]
+            if ia_vals:
+                brainstorming_methods["approach3_inscribed_angle"]["median_angle_deg"] = float(
+                    np.median(ia_vals)
+                )
+            try:
+                annotate_approach3_inscribed_angle_image(
+                    ann_base,
+                    a3_ia_curves,
+                    processed.nm_per_pixel,
+                    self.config,
+                    output_path=str(a3_ia_path),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[APPROACH 3] inscribed-angle annotate failed: %s", exc)
+                a3_ia_path = output_dir / f"{image_path.stem}_method1_approach3_inscribed_angle.png"
+
+            # Reference-style yellow V + α, red d, purple arch, cyan R
+            a3_ref_path = output_dir / f"{image_path.stem}_method1_approach3_d_r_reference.png"
+            a3_ref_curves = build_d_r_reference_curves(a3_curves, m2_curves, m1_curves)
+            brainstorming_methods["approach3_d_r_reference"] = {
+                "approach": "openai_tips_d_r_reference",
+                "label": "OpenAI tips — projected d + inscribed R (reference style)",
+                "count": sum(
+                    1
+                    for c in a3_ref_curves
+                    if c.get("d_nm") is not None and c.get("radius_nm") is not None
+                ),
+                "per_curve": a3_ref_curves,
+            }
+            try:
+                annotate_approach3_d_r_reference_image(
+                    ann_base,
+                    a3_ref_curves,
+                    processed.nm_per_pixel,
+                    self.config,
+                    output_path=str(a3_ref_path),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[APPROACH 3] d+R reference annotate failed: %s", exc)
+                a3_ref_path = output_dir / f"{image_path.stem}_method1_approach3_d_r_reference.png"
+
             log.info(
                 "[APPROACH 3] wrote %s fitted=%d mean=%s std=%s openai_ok=%s",
                 a3_path.name,
@@ -488,17 +711,34 @@ class SEMAnalysisPipeline:
                 (approach3.get("openai") or {}).get("ok"),
             )
             log.info(
-                "[APPROACH 3] fixed-distance overlay wrote %s tips=%d with_R=%d",
+                "[APPROACH 3] fixed-distance=%s tips=%d | projected-tip=%s tips=%d | "
+                "inscribed-angle=%s tips=%d | d+R ref=%s tips=%d",
                 a3_fd_path.name,
-                len(a3_fd_curves),
                 brainstorming_methods["approach3_fixed_distance"]["count"],
+                a3_pt_path.name,
+                brainstorming_methods["approach3_projected_tip"]["count"],
+                a3_ia_path.name,
+                brainstorming_methods["approach3_inscribed_angle"]["count"],
+                a3_ref_path.name,
+                brainstorming_methods["approach3_d_r_reference"]["count"],
             )
+
+            brainstorming_methods["method_reconciliation"] = _reconcile_method1_vs_vision(
+                m1_curves,
+                list(approach3.get("per_curve") or []),
+            )
+            diag = brainstorming_methods.setdefault("diagnostics", {})
+            if isinstance(diag, dict):
+                diag["method_reconciliation"] = brainstorming_methods["method_reconciliation"]
 
             annotated_method_paths = {
                 "method1": str(method1_path),
                 "method1_approach2": str(a2_path),
                 "method1_approach3": str(a3_path),
                 "method1_approach3_fixed_distance": str(a3_fd_path),
+                "method1_approach3_projected_tip": str(a3_pt_path),
+                "method1_approach3_inscribed_angle": str(a3_ia_path),
+                "method1_approach3_d_r_reference": str(a3_ref_path),
                 "method2": str(method2_path),
                 "method3": str(method3_path),
             }
@@ -515,12 +755,18 @@ class SEMAnalysisPipeline:
             m2 = brainstorming_methods.get("projected_tip_distance", {})
             aggregation = {
                 "count": m1.get("count", 0),
-                "mean_radius_nm": m1.get("median_radius_nm") or m1.get("median"),
+                "mean_radius_nm": m1.get("mean") or m1.get("mean_radius_nm"),
                 "median_radius_nm": m1.get("median_radius_nm") or m1.get("median"),
-                "std_radius_nm": m1.get("std"),
+                "std_radius_nm": m1.get("std") or m1.get("std_radius_nm"),
+                "iqr_radius_nm": m1.get("iqr"),
+                "q25_radius_nm": m1.get("q25"),
+                "q75_radius_nm": m1.get("q75"),
                 "method2_median_l_nm": m2.get("median_distance_l_nm") or m2.get("median"),
                 "n_hard_valid": brainstorming_methods.get("tip_validation", {}).get("n_accepted", 0),
                 "n_marked": m1.get("n_marked"),
+                "multi_peak": bool(
+                    (brainstorming_methods.get("diagnostics") or {}).get("multi_peak")
+                ),
                 "approach2_median_radius_nm": (
                     brainstorming_methods.get("approach2_parabolas")
                     or brainstorming_methods.get("approach2_circular_arcs")
@@ -533,7 +779,12 @@ class SEMAnalysisPipeline:
                 ).get("count"),
                 "approach3_median_radius_nm": (
                     brainstorming_methods.get("approach3_openai_vlm") or {}
-                ).get("median_radius_nm"),
+                ).get("median_radius_nm")
+                or (brainstorming_methods.get("approach3_openai_vlm") or {}).get("median"),
+                "approach3_mean_radius_nm": (
+                    brainstorming_methods.get("approach3_openai_vlm") or {}
+                ).get("mean_radius_nm")
+                or (brainstorming_methods.get("approach3_openai_vlm") or {}).get("mean"),
                 "approach3_count": (
                     brainstorming_methods.get("approach3_openai_vlm") or {}
                 ).get("count"),
@@ -546,7 +797,8 @@ class SEMAnalysisPipeline:
             primary_method = radius_cfg.get("primary_method", "hough")
 
         tip_condition = None
-        mean_r = aggregation.get("mean_radius_nm") or aggregation.get("median_radius_nm")
+        # Prefer median for multi-peak serrated edges (mean can skew blunt/sharp)
+        mean_r = aggregation.get("median_radius_nm") or aggregation.get("mean_radius_nm")
         if mean_r is not None:
             tip_condition = classify_tip_condition(mean_r, self.config).value
 
@@ -638,12 +890,18 @@ class SEMAnalysisPipeline:
                 all_radii=all_radii,
             )
 
-        # [8] Validation
+        # [8] Validation — use Method 1 tips when arch-first (legacy all_radii is empty)
         validation_result = None
         if ground_truth_path:
             gt = load_ground_truth(ground_truth_path)
             max_dist = self.config.get("validation", {}).get("alignment_max_distance_px", 50)
-            comparison = align_predictions(all_radii, gt, max_dist)
+            gt_preds = list(all_radii)
+            if not gt_preds and arch_first:
+                m1_for_gt = (
+                    brainstorming_methods.get("fixed_distance_circle", {}).get("per_curve") or []
+                )
+                gt_preds = _method1_curves_to_radius_results(m1_for_gt, processed.nm_per_pixel)
+            comparison = align_predictions(gt_preds, gt, max_dist)
             metrics = compute_error_metrics(comparison)
             validation_result = generate_validation_report(
                 comparison, metrics, output_dir, image_path.stem

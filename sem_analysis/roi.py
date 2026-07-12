@@ -75,11 +75,15 @@ def extract_measurement_roi(
     image: np.ndarray,
     border_margin_px: int = 10,
     footer_row: int | None = None,
+    top_margin_px: int | None = None,
 ) -> MeasurementROI:
     """
     Remove SEM footer and border margin before edge detection.
 
     Footer is detected when footer_row is None (do not hardcode 548).
+    top_margin_px defaults to 0 so serrated tips near the top of the frame
+    keep enough room above them for Method 2 projection (sides/bottom still
+    use border_margin_px).
     """
     h, w = image.shape[:2]
     if footer_row is None:
@@ -87,11 +91,12 @@ def extract_measurement_roi(
     footer_row = int(np.clip(footer_row, 1, h))
 
     m = int(max(0, border_margin_px))
-    y0, y1 = m, footer_row - m
+    top_m = int(max(0, m if top_margin_px is None else top_margin_px))
+    y0, y1 = top_m, footer_row - m
     x0, x1 = m, w - m
     if y1 <= y0 + 20 or x1 <= x0 + 20:
         # Degenerate — return almost-full image with tiny margin
-        y0, y1, x0, x1 = 1, max(2, footer_row - 1), 1, max(2, w - 1)
+        y0, y1, x0, x1 = 0, max(2, footer_row - 1), 1, max(2, w - 1)
 
     cropped = image[y0:y1, x0:x1].copy()
     return MeasurementROI(

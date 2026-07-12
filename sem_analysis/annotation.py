@@ -511,6 +511,22 @@ def match_fixed_distance_to_tips(
     max_dist_px: float = 40.0,
 ) -> list[dict]:
     """Pair OpenAI / Vision tips with nearest fixed-distance Method 1 geometry."""
+    return match_geometry_to_tips(
+        tip_curves,
+        method1_curves,
+        max_dist_px=max_dist_px,
+        miss_reason="no_fixed_distance_match",
+    )
+
+
+def match_geometry_to_tips(
+    tip_curves: list[dict],
+    geometry_curves: list[dict],
+    *,
+    max_dist_px: float = 40.0,
+    miss_reason: str = "no_geometry_match",
+) -> list[dict]:
+    """Pair OpenAI / Vision tips with nearest geometry curves (Method 1/2/3)."""
     matched: list[dict] = []
     for tip_c in tip_curves:
         tip = tip_c.get("tip_point") or tip_c.get("peak_location")
@@ -519,17 +535,23 @@ def match_fixed_distance_to_tips(
         tx, ty = float(tip[0]), float(tip[1])
         best = None
         best_d = float("inf")
-        for m1 in method1_curves:
-            mt = m1.get("tip_point") or m1.get("peak_location")
+        for geo in geometry_curves:
+            mt = (
+                geo.get("tip_point")
+                or geo.get("peak_location")
+                or geo.get("ultimate_tip")
+            )
             if not mt or len(mt) < 2:
                 continue
             d = math.hypot(tx - float(mt[0]), ty - float(mt[1]))
             if d < best_d:
                 best_d = d
-                best = m1
+                best = geo
         if best is not None and best_d <= max_dist_px:
             rec = dict(best)
-            rec["peak_id"] = tip_c.get("peak_id", best.get("peak_id"))
+            rec["peak_id"] = tip_c.get(
+                "peak_id", best.get("peak_id") or best.get("tip_id")
+            )
             rec["peak_location"] = [tx, ty]
             rec["tip_point"] = [tx, ty]
             rec["openai_tip"] = [tx, ty]
@@ -540,8 +562,9 @@ def match_fixed_distance_to_tips(
                     "peak_id": tip_c.get("peak_id"),
                     "tip_point": [tx, ty],
                     "peak_location": [tx, ty],
+                    "openai_tip": [tx, ty],
                     "valid": False,
-                    "rejection_reason": "no_fixed_distance_match",
+                    "rejection_reason": miss_reason,
                 }
             )
     return matched
@@ -562,16 +585,15 @@ def annotate_approach3_fixed_distance_image(
     img = _base_image(image)
     for i, curve in enumerate(per_curve):
         _draw_method1_curve(img, curve, i)
-        # Keep Vision tip visible as yellow on top of the construction
         tip = curve.get("openai_tip") or curve.get("tip_point") or curve.get("peak_location")
         if tip:
-            _draw_dot(img, tip, YELLOW, 4)
+            _draw_dot(img, tip, YELLOW, 3)
     cv2.putText(
         img,
-        "OpenAI tips + fixed-distance circle: blue=3 pts  red=l+chord  cyan=R  yellow=Vision tip",
+        "Fixed-distance circle: blue=tip+L/R hits  red=l+chord  cyan=R  yellow=Vision tip",
         (12, 28),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.42,
+        0.40,
         BLUE,
         2,
         cv2.LINE_AA,
@@ -580,6 +602,338 @@ def annotate_approach3_fixed_distance_image(
         _save_annotated(img, output_path, nm_per_pixel, config)
     return img
 
+
+def annotate_approach3_projected_tip_image(
+    image: np.ndarray,
+    per_curve: list[dict],
+    nm_per_pixel: float,
+    config: dict,
+    output_path: str | None = None,
+) -> np.ndarray:
+    """
+    OpenAI Vision tips + distance from projected tip:
+    yellow flank lines → convergent point, red vertical l, blue ultimate tip.
+    """
+    img = _base_image(image)
+    for i, curve in enumerate(per_curve):
+        _draw_method2_curve(img, curve, i)
+        tip = curve.get("openai_tip") or curve.get("tip_point") or curve.get("peak_location")
+        if tip:
+            _draw_dot(img, tip, YELLOW, 3)
+    cv2.putText(
+        img,
+        "Projected tip: yellow=edges→converge  red=vertical l  blue=ultimate tip",
+        (12, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        YELLOW,
+        2,
+        cv2.LINE_AA,
+    )
+    if output_path:
+        _save_annotated(img, output_path, nm_per_pixel, config)
+    return img
+
+
+def annotate_approach3_inscribed_angle_image(
+    image: np.ndarray,
+    per_curve: list[dict],
+    nm_per_pixel: float,
+    config: dict,
+    output_path: str | None = None,
+) -> np.ndarray:
+    """
+    OpenAI Vision tips + inscribed angle from fixed-diameter circle:
+    cyan fixed-D circle, yellow rays from tip through edge hits, θ label.
+    """
+    img = _base_image(image)
+    for i, curve in enumerate(per_curve):
+        _draw_method3_curve(img, curve, i)
+        tip = curve.get("openai_tip") or curve.get("tip_point") or curve.get("peak_location")
+        if tip:
+            _draw_dot(img, tip, YELLOW, 3)
+    cv2.putText(
+        img,
+        "Inscribed angle (Interp. A): cyan=D at T  yellow=rays tip→intersections  theta",
+        (12, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.40,
+        CYAN,
+        2,
+        cv2.LINE_AA,
+    )
+    if output_path:
+        _save_annotated(img, output_path, nm_per_pixel, config)
+    return img
+
+
+# ── Reference-style d + R composite (WhatsApp / Fraunhofer sketch) ──────────
+# Added as a NEW overlay path — does not modify existing drawers above.
+
+REF_ARCH_PURPLE = (200, 60, 220)  # tip arch curve (BGR)
+
+
+def _nearest_curve(
+    tip: list | tuple,
+    curves: list[dict],
+    *,
+    max_dist_px: float = 40.0,
+) -> dict | None:
+    tx, ty = float(tip[0]), float(tip[1])
+    best = None
+    best_d = float("inf")
+    for c in curves:
+        mt = c.get("tip_point") or c.get("peak_location") or c.get("ultimate_tip")
+        if not mt or len(mt) < 2:
+            continue
+        d = math.hypot(tx - float(mt[0]), ty - float(mt[1]))
+        if d < best_d:
+            best_d = d
+            best = c
+    if best is None or best_d > max_dist_px:
+        return None
+    return best
+
+
+def _synth_alpha_arc(projected, left_line, right_line, d_px: float) -> dict | None:
+    """Build α arc dict at projected tip from yellow flank endpoints."""
+    if not projected or len(left_line) < 4 or len(right_line) < 4:
+        return None
+    px, py = float(projected[0]), float(projected[1])
+
+    def _dir_into_body(line):
+        x1, y1, x2, y2 = (float(v) for v in line[:4])
+        # pick the endpoint farther down (+y) from projected as "into body"
+        d1 = (x1 - px, y1 - py)
+        d2 = (x2 - px, y2 - py)
+        # prefer the direction with larger +y component
+        if d1[1] >= d2[1]:
+            vx, vy = d1
+        else:
+            vx, vy = d2
+        n = math.hypot(vx, vy) or 1.0
+        return vx / n, vy / n
+
+    dl = _dir_into_body(left_line)
+    dr = _dir_into_body(right_line)
+    a1 = math.degrees(math.atan2(dl[1], dl[0]))
+    a2 = math.degrees(math.atan2(dr[1], dr[0]))
+    start, end = sorted([a1, a2])
+    if end - start > 180:
+        start, end = end, start + 360
+    arc_r = max(18.0, min(50.0, 0.35 * max(d_px, 8.0) + 12.0))
+    return {
+        "center": [px, py],
+        "radius": float(arc_r),
+        "start_deg": float(start),
+        "end_deg": float(end),
+    }
+
+
+def build_d_r_reference_curves(
+    tip_curves: list[dict],
+    projected_curves: list[dict],
+    radius_curves: list[dict],
+    *,
+    max_dist_px: float = 40.0,
+) -> list[dict]:
+    """
+    Merge projected-tip geometry (yellow V + d) with fixed-distance R
+    for each Vision tip — data for the reference-style composite PNG.
+    """
+    out: list[dict] = []
+    for tip_c in tip_curves:
+        tip = tip_c.get("tip_point") or tip_c.get("peak_location")
+        if not tip or len(tip) < 2:
+            continue
+        tx, ty = float(tip[0]), float(tip[1])
+        m2 = _nearest_curve(tip, projected_curves, max_dist_px=max_dist_px)
+        m1 = _nearest_curve(tip, radius_curves, max_dist_px=max_dist_px)
+        rec: dict = {
+            "peak_id": tip_c.get("peak_id"),
+            "tip_point": [tx, ty],
+            "peak_location": [tx, ty],
+            "ultimate_tip": [tx, ty],
+            "openai_tip": [tx, ty],
+        }
+        if m2:
+            projected = m2.get("projected_tip") or m2.get("convergence_point")
+            rec["projected_tip"] = list(projected) if projected else None
+            rec["convergence_point"] = rec["projected_tip"]
+            rec["left_line"] = m2.get("left_line") or []
+            rec["right_line"] = m2.get("right_line") or []
+            rec["tip_apex_arc"] = m2.get("tip_apex_arc") or []
+            rec["included_angle_deg"] = m2.get("included_angle_deg")
+            d_nm = m2.get("distance_l_nm") or m2.get("d_nm")
+            d_px = m2.get("distance_l_px") or m2.get("d_px")
+            rec["d_nm"] = float(d_nm) if d_nm is not None else None
+            rec["d_px"] = float(d_px) if d_px is not None else None
+            rec["distance_l_nm"] = rec["d_nm"]
+            if projected:
+                rec["d_bracket"] = [
+                    float(projected[0]), float(projected[1]), tx, ty,
+                ]
+                rec["vertical_l_line"] = list(rec["d_bracket"])
+            if not rec.get("d_px") and projected:
+                rec["d_px"] = abs(ty - float(projected[1]))
+            rec["alpha_arc"] = _synth_alpha_arc(
+                projected,
+                rec["left_line"],
+                rec["right_line"],
+                float(rec.get("d_px") or 20.0),
+            )
+        if m1:
+            if m1.get("radius_nm") is not None:
+                rec["radius_nm"] = float(m1["radius_nm"])
+            if m1.get("radius_px") is not None:
+                rec["radius_px"] = float(m1["radius_px"])
+                rec["circle_radius_px"] = float(m1["radius_px"])
+            center = m1.get("center") or m1.get("circle_center")
+            if center:
+                rec["center"] = [float(center[0]), float(center[1])]
+                rec["circle_center"] = list(rec["center"])
+                rpx = rec.get("radius_px")
+                if rpx:
+                    rec["diameter_line"] = [
+                        float(center[0]) - float(rpx),
+                        float(center[1]),
+                        float(center[0]) + float(rpx),
+                        float(center[1]),
+                    ]
+            rec["valid"] = bool(m1.get("valid", True) and rec.get("radius_nm") is not None)
+        else:
+            rec["valid"] = False
+            if not m2:
+                rec["rejection_reason"] = "no_projected_or_radius_match"
+        out.append(rec)
+    return out
+
+
+def _draw_yellow_alpha_arc(img: np.ndarray, arc: dict) -> None:
+    """Yellow α marker at projected tip (matches reference sketch)."""
+    if not arc:
+        return
+    c = arc.get("center")
+    r = int(max(8, arc.get("radius", 24)))
+    if not c:
+        return
+    cx, cy = int(c[0]), int(c[1])
+    start = float(arc.get("start_deg", 0))
+    end = float(arc.get("end_deg", 40))
+    cv2.ellipse(img, (cx, cy), (r, r), 0, start, end, YELLOW, 2, cv2.LINE_AA)
+    mid = math.radians(0.5 * (start + end))
+    lx = int(cx + (r + 8) * math.cos(mid))
+    ly = int(cy + (r + 8) * math.sin(mid))
+    cv2.putText(img, "a", (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.5, YELLOW, 2, cv2.LINE_AA)
+
+
+def _draw_d_value_bracket(
+    img: np.ndarray,
+    projected,
+    ultimate,
+    d_nm: float | None,
+) -> None:
+    """Red vertical d from projected tip → ultimate tip with numeric label."""
+    if not projected or not ultimate:
+        return
+    x1, y1 = float(projected[0]), float(projected[1])
+    x2, y2 = float(ultimate[0]), float(ultimate[1])
+    # Vertical at projected x (as in reference)
+    vx = int(round(x1))
+    p1 = (vx, int(round(y1)))
+    p2 = (vx, int(round(y2)))
+    cv2.line(img, p1, p2, RED, 2, cv2.LINE_AA)
+    tick = 7
+    cv2.line(img, (p1[0] - tick, p1[1]), (p1[0] + tick, p1[1]), RED, 2, cv2.LINE_AA)
+    cv2.line(img, (p2[0] - tick, p2[1]), (p2[0] + tick, p2[1]), RED, 2, cv2.LINE_AA)
+    # Horizontal tick across ultimate tip
+    cv2.line(img, (p2[0] - 12, p2[1]), (p2[0] + 12, p2[1]), RED, 1, cv2.LINE_AA)
+    if d_nm is not None:
+        label = f"d = {d_nm:.2f} nm"
+        lx = p1[0] + 10
+        ly = int(0.5 * (p1[1] + p2[1]))
+        cv2.putText(img, label, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.42, RED, 2, cv2.LINE_AA)
+
+
+def _draw_d_r_reference_tip(img: np.ndarray, curve: dict, index: int = 0) -> None:
+    """
+    One tip drawn like the Fraunhofer WhatsApp reference:
+      yellow V + α · red d · purple arch · cyan inscribed circle + R
+    """
+    # Yellow projected flanks
+    _draw_line(img, curve.get("left_line", []), YELLOW, 2)
+    _draw_line(img, curve.get("right_line", []), YELLOW, 2)
+
+    projected = curve.get("projected_tip") or curve.get("convergence_point")
+    ultimate = (
+        curve.get("ultimate_tip")
+        or curve.get("tip_point")
+        or curve.get("peak_location")
+    )
+    if projected:
+        _draw_dot(img, projected, YELLOW, 5)
+
+    # Yellow α at projected tip
+    _draw_yellow_alpha_arc(img, curve.get("alpha_arc") or {})
+
+    # Purple physical tip arch
+    arc = curve.get("tip_apex_arc") or []
+    if len(arc) >= 2:
+        _draw_polyline(img, arc, REF_ARCH_PURPLE, 2)
+
+    # Red d
+    _draw_d_value_bracket(img, projected, ultimate, curve.get("d_nm"))
+
+    # Cyan inscribed circle + horizontal diameter
+    center = curve.get("circle_center") or curve.get("center")
+    r_px = curve.get("circle_radius_px") or curve.get("radius_px")
+    if center and r_px and float(r_px) > 0:
+        cx, cy = int(round(center[0])), int(round(center[1]))
+        rr = max(3, int(round(float(r_px))))
+        cv2.circle(img, (cx, cy), rr, CYAN, 2, cv2.LINE_AA)
+        _draw_dot(img, center, CYAN, 3)
+        diam = curve.get("diameter_line")
+        if diam and len(diam) >= 4:
+            _draw_line(img, diam, CYAN, 1)
+        else:
+            _draw_line(img, [cx - rr, cy, cx + rr, cy], CYAN, 1)
+
+    # R label (cyan), placed to the side of the tip
+    if ultimate and curve.get("radius_nm") is not None:
+        px, py = int(ultimate[0]), int(ultimate[1])
+        ly = py + 16 if index % 2 == 0 else py + 28
+        label = f"R = {curve['radius_nm']:.2f} nm"
+        cv2.putText(img, label, (px + 12, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.42, CYAN, 2, cv2.LINE_AA)
+
+
+def annotate_approach3_d_r_reference_image(
+    image: np.ndarray,
+    per_curve: list[dict],
+    nm_per_pixel: float,
+    config: dict,
+    output_path: str | None = None,
+) -> np.ndarray:
+    """
+    NEW OpenAI Vision panel matching the annotated SEM reference:
+    yellow projected flanks + α, red d, purple tip arch, cyan R circle.
+    Does not modify existing annotate_* functions.
+    """
+    img = _base_image(image)
+    for i, curve in enumerate(per_curve):
+        _draw_d_r_reference_tip(img, curve, i)
+    cv2.putText(
+        img,
+        "Reference: yellow=V+a  red=d  purple=arch  cyan=R (projected tip + inscribed circle)",
+        (12, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.40,
+        YELLOW,
+        2,
+        cv2.LINE_AA,
+    )
+    if output_path:
+        _save_annotated(img, output_path, nm_per_pixel, config)
+    return img
 
 
 def annotate_method2_image(
@@ -621,7 +975,7 @@ def annotate_method3_image(
         _draw_method3_curve(img, curve, i)
     cv2.putText(
         img,
-        "Method 3: cyan=fixed-D circle  yellow=rays tip->edge  theta=included angle",
+        "Method 3: cyan=fixed-D at tip T  yellow=rays T→P_L/P_R  theta=included angle (Interp. A)",
         (12, 28),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.48,

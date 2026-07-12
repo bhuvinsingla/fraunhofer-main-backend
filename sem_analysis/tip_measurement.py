@@ -244,6 +244,78 @@ def _apply_method1_to_tip(
     return primary, point_rec, mark_rec, rad_rec
 
 
+def _build_diagnostics(
+    tips: list[TipMeasurement],
+    proto: dict,
+    nm_per_px: float,
+) -> dict:
+    """Peak spacing vs protocol constants + Method 2 coverage notes."""
+    ys = sorted(float(t.apex_y_px) for t in tips)
+    spacings_nm: list[float] = []
+    if len(ys) >= 2 and nm_per_px > 0:
+        spacings_nm = [abs(ys[i + 1] - ys[i]) * nm_per_px for i in range(len(ys) - 1)]
+
+    l1 = float(proto.get("method1_primary_nm", 50))
+    d3 = float(proto.get("method3_circle_diameter_nm", 100))
+    med_spacing = float(np.median(spacings_nm)) if spacings_nm else None
+
+    warnings: list[str] = []
+    if not proto.get("approved", False):
+        warnings.append(
+            f"Protocol constants not client-approved (l={l1:g} nm, D={d3:g} nm)."
+        )
+    if med_spacing is not None:
+        if l1 >= 0.8 * med_spacing:
+            warnings.append(
+                f"Method 1 offset l={l1:g} nm is >=80% of median peak spacing "
+                f"({med_spacing:.1f} nm) — chord may reach a neighboring peak."
+            )
+        if d3 >= 0.8 * med_spacing:
+            warnings.append(
+                f"Method 3 diameter D={d3:g} nm is >=80% of median peak spacing "
+                f"({med_spacing:.1f} nm) — circle may intersect a neighbor."
+            )
+
+    m2_ok = sum(1 for t in tips if t.method2_valid)
+    m2_fail = [
+        {
+            "peak_id": t.tip_id,
+            "reason": (t.method2 or {}).get("rejection_reason") or "unknown",
+            "y_px": t.apex_y_px,
+        }
+        for t in tips
+        if not t.method2_valid
+    ]
+
+    return {
+        "n_tips": len(tips),
+        "peak_spacing_nm": {
+            "median": med_spacing,
+            "min": float(min(spacings_nm)) if spacings_nm else None,
+            "max": float(max(spacings_nm)) if spacings_nm else None,
+            "values": [round(s, 2) for s in spacings_nm],
+        },
+        "protocol_constants": {
+            "method1_primary_nm": l1,
+            "method3_circle_diameter_nm": d3,
+            "approved": bool(proto.get("approved", False)),
+        },
+        "warnings": warnings,
+        "method2_coverage": {
+            "n_ok": m2_ok,
+            "n_failed": len(m2_fail),
+            "failed": m2_fail,
+        },
+        "multi_peak": len(tips) > 1,
+        "reading_note": (
+            "Serrated / multi-peak edge: report median R with IQR rather than a "
+            "single tip radius."
+            if len(tips) > 1
+            else "Single tip detected."
+        ),
+    }
+
+
 def measure_all_tips(
     roi: MeasurementROI,
     nm_per_px: float,
@@ -393,7 +465,10 @@ def measure_all_tips(
         drop_border_tips = bool(config.get("tip_validation", {}).get("drop_border_tips", True))
 
         tip_id = 0
-        for peak in peaks:
+        # Precompute tip Ys so Method 2 can cap fit depth before the next serration
+        peak_ys = [float(np.asarray(p, dtype=float)[1]) for p in peaks]
+
+        for peak_i, peak in enumerate(peaks):
             apex = np.asarray(peak, dtype=float)
             ax, ay = float(apex[0]), float(apex[1])
             border_ok = border_px <= ax < (w - border_px) and border_px <= ay < (h - border_px)
@@ -406,6 +481,14 @@ def measure_all_tips(
             left_ok = branches is not None
             right_ok = branches is not None
             hard_ok = bool(border_ok and branches is not None)
+
+            # Half-gap to nearest other peak (nm) — keeps Method 2 out of Λ valleys
+            m2_depth_cap = None
+            if len(peak_ys) >= 2:
+                gaps = [abs(ay - other_y) for j, other_y in enumerate(peak_ys) if j != peak_i]
+                if gaps:
+                    m2_depth_cap = 0.45 * min(gaps) * nm_per_px
+                    m2_depth_cap = float(max(40.0, min(m2_depth_cap, 180.0)))
 
             tm = TipMeasurement(
                 tip_id=tip_id,
@@ -477,7 +560,7 @@ def measure_all_tips(
                         tip_id, rad_rec.get("rejection_reason"),
                     )
 
-            # Methods 2–3 on same tip (best-effort)
+            # Methods 2–3 on same tip (best-effort — always record reason on failure)
             try:
                 m2 = measure_projected_tip_distance(
                     nm_per_pixel=nm_per_px,
@@ -487,7 +570,7 @@ def measure_all_tips(
                     right=right,
                     tip_id=tip_id,
                     min_flank_points=int(
-                        method_cfg.get("projected_tip_distance", {}).get("min_flank_points", 4)
+                        method_cfg.get("projected_tip_distance", {}).get("min_flank_points", 3)
                     ),
                     min_cross=float(
                         config.get("tip_validation", {}).get("method2_min_cross", 0.08)
@@ -495,11 +578,26 @@ def measure_all_tips(
                     max_distance_nm=float(
                         config.get("tip_validation", {}).get("method2_max_l_nm", 250.0)
                     ),
+                    max_band_depth_nm=m2_depth_cap,
                 )
                 tm.method2 = projected_tip_distance_to_dict(m2)
                 tm.method2_valid = bool(m2.valid)
+                if not tm.method2_valid:
+                    log.info(
+                        "[METHOD 2] tip_id=%s FAILED reason=%s",
+                        tip_id,
+                        tm.method2.get("rejection_reason"),
+                    )
             except Exception as exc:
-                log.debug("method2 tip %s skipped: %s", tip_id, exc)
+                log.warning("method2 tip %s failed: %s", tip_id, exc)
+                tm.method2 = {
+                    "tip_id": tip_id,
+                    "tip_point": [float(apex[0]), float(apex[1])],
+                    "peak_location": [float(apex[0]), float(apex[1])],
+                    "valid": False,
+                    "rejection_reason": f"exception:{type(exc).__name__}",
+                }
+                tm.method2_valid = False
 
             try:
                 m3 = measure_inscribed_angle(
@@ -513,7 +611,15 @@ def measure_all_tips(
                 tm.method3 = inscribed_angle_to_dict(m3)
                 tm.method3_valid = bool(m3.valid)
             except Exception as exc:
-                log.debug("method3 tip %s skipped: %s", tip_id, exc)
+                log.warning("method3 tip %s failed: %s", tip_id, exc)
+                tm.method3 = {
+                    "tip_id": tip_id,
+                    "tip_point": [float(apex[0]), float(apex[1])],
+                    "peak_location": [float(apex[0]), float(apex[1])],
+                    "valid": False,
+                    "rejection_reason": f"exception:{type(exc).__name__}",
+                }
+                tm.method3_valid = False
 
             if tm.method1_valid:
                 tm.confidence = tip_confidence(
@@ -558,6 +664,16 @@ def measure_all_tips(
                 confidence=0.0,
             )
             if not hard_ok or left is None or right is None:
+                tm.method2 = {
+                    "tip_id": arch.tip_id,
+                    "valid": False,
+                    "rejection_reason": reason or "insufficient_branches",
+                }
+                tm.method3 = {
+                    "tip_id": arch.tip_id,
+                    "valid": False,
+                    "rejection_reason": reason or "insufficient_branches",
+                }
                 tips.append(tm)
                 continue
             primary, point_rec, mark_rec, rad_rec = _apply_method1_to_tip(
@@ -570,32 +686,51 @@ def measure_all_tips(
                 stage3_marks.append(mark_rec)
             if rad_rec:
                 stage4_radii.append(rad_rec)
-            m2 = measure_projected_tip_distance(
-                nm_per_pixel=nm_per_px,
-                fit_band_nm=proto["method2_fit_band_nm"],
-                apex=apex,
-                left=left,
-                right=right,
-                tip_id=arch.tip_id,
-                min_flank_points=int(
-                    method_cfg.get("projected_tip_distance", {}).get("min_flank_points", 4)
-                ),
-                min_cross=float(
-                    config.get("tip_validation", {}).get("method2_min_cross", 0.08)
-                ),
-            )
-            tm.method2 = projected_tip_distance_to_dict(m2)
-            tm.method2_valid = bool(m2.valid)
-            m3 = measure_inscribed_angle(
-                apex=apex,
-                left=left,
-                right=right,
-                nm_per_pixel=nm_per_px,
-                circle_diameter_nm=float(proto.get("method3_circle_diameter_nm", 100)),
-                tip_id=arch.tip_id,
-            )
-            tm.method3 = inscribed_angle_to_dict(m3)
-            tm.method3_valid = bool(m3.valid)
+            try:
+                m2 = measure_projected_tip_distance(
+                    nm_per_pixel=nm_per_px,
+                    fit_band_nm=proto["method2_fit_band_nm"],
+                    apex=apex,
+                    left=left,
+                    right=right,
+                    tip_id=arch.tip_id,
+                    min_flank_points=int(
+                        method_cfg.get("projected_tip_distance", {}).get("min_flank_points", 3)
+                    ),
+                    min_cross=float(
+                        config.get("tip_validation", {}).get("method2_min_cross", 0.08)
+                    ),
+                    max_distance_nm=float(
+                        config.get("tip_validation", {}).get("method2_max_l_nm", 250.0)
+                    ),
+                )
+                tm.method2 = projected_tip_distance_to_dict(m2)
+                tm.method2_valid = bool(m2.valid)
+            except Exception as exc:
+                tm.method2 = {
+                    "tip_id": arch.tip_id,
+                    "valid": False,
+                    "rejection_reason": f"exception:{type(exc).__name__}",
+                }
+                tm.method2_valid = False
+            try:
+                m3 = measure_inscribed_angle(
+                    apex=apex,
+                    left=left,
+                    right=right,
+                    nm_per_pixel=nm_per_px,
+                    circle_diameter_nm=float(proto.get("method3_circle_diameter_nm", 100)),
+                    tip_id=arch.tip_id,
+                )
+                tm.method3 = inscribed_angle_to_dict(m3)
+                tm.method3_valid = bool(m3.valid)
+            except Exception as exc:
+                tm.method3 = {
+                    "tip_id": arch.tip_id,
+                    "valid": False,
+                    "rejection_reason": f"exception:{type(exc).__name__}",
+                }
+                tm.method3_valid = False
             tips.append(tm)
 
     # Shift Method 1 geometry from ROI → full-image coords for annotation
@@ -649,6 +784,20 @@ def measure_all_tips(
             base["valid"] = False
             failed_curves.append(base)
 
+    m1_stats = summarize_values(
+        _vals(
+            lambda t: (t.method1.get("projected_radius_nm") or t.method1.get("radius_nm"))
+            if t.method1_valid
+            else None
+        )
+    )
+    m2_stats = summarize_values(
+        _vals(lambda t: t.method2.get("distance_l_nm") if t.method2_valid else None)
+    )
+    m3_stats = summarize_values(
+        _vals(lambda t: t.method3.get("angle_degrees") if t.method3_valid else None)
+    )
+
     summary = {
         "image_id": image_id,
         "n_detected_arches": n_candidates,
@@ -662,10 +811,10 @@ def measure_all_tips(
         "fixed_distance_circle": {
             "headline": "median",
             "label": "Method 1 — Fixed distance inscribed circle",
-            **summarize_values(
-                _vals(lambda t: (t.method1.get("projected_radius_nm") or t.method1.get("radius_nm"))
-                      if t.method1_valid else None)
-            ),
+            **m1_stats,
+            "median_radius_nm": m1_stats.get("median"),
+            "mean_radius_nm": m1_stats.get("mean"),
+            "std_radius_nm": m1_stats.get("std"),
             "count": sum(1 for t in tips if t.method1_valid),
             "n_marked": len(tips),
             "per_curve": per_curve,
@@ -673,21 +822,47 @@ def measure_all_tips(
         },
         "projected_tip_distance": {
             "headline": "median",
-            **summarize_values(_vals(lambda t: t.method2.get("distance_l_nm") if t.method2_valid else None)),
-            "median_distance_l_nm": None,
+            **m2_stats,
+            "median_distance_l_nm": m2_stats.get("median"),
             "count": sum(1 for t in tips if t.method2_valid),
+            "n_marked": len(tips),
             "per_curve": [
-                {"peak_id": t.tip_id, "peak_location": [t.apex_x_px, t.apex_y_px], **t.method2}
+                {"peak_id": t.tip_id, "peak_location": [t.apex_x_px, t.apex_y_px], **(t.method2 or {})}
                 for t in tips if t.method2_valid
+            ],
+            "failed_curves": [
+                {
+                    "peak_id": t.tip_id,
+                    "peak_location": [t.apex_x_px, t.apex_y_px],
+                    **(t.method2 or {}),
+                    "valid": False,
+                    "rejection_reason": (t.method2 or {}).get("rejection_reason")
+                    or t.rejection_reason
+                    or "invalid",
+                }
+                for t in tips if not t.method2_valid
             ],
         },
         "inscribed_angle": {
             "headline": "median",
-            **summarize_values(_vals(lambda t: t.method3.get("angle_degrees") if t.method3_valid else None)),
+            **m3_stats,
             "count": sum(1 for t in tips if t.method3_valid),
+            "n_marked": len(tips),
             "per_curve": [
-                {"peak_id": t.tip_id, "peak_location": [t.apex_x_px, t.apex_y_px], **t.method3}
+                {"peak_id": t.tip_id, "peak_location": [t.apex_x_px, t.apex_y_px], **(t.method3 or {})}
                 for t in tips if t.method3_valid
+            ],
+            "failed_curves": [
+                {
+                    "peak_id": t.tip_id,
+                    "peak_location": [t.apex_x_px, t.apex_y_px],
+                    **(t.method3 or {}),
+                    "valid": False,
+                    "rejection_reason": (t.method3 or {}).get("rejection_reason")
+                    or t.rejection_reason
+                    or "invalid",
+                }
+                for t in tips if not t.method3_valid
             ],
         },
         "tip_validation": {
@@ -695,6 +870,7 @@ def measure_all_tips(
             "n_rejected": len(tips) - len(accepted),
             "n_measured": len(measured),
         },
+        "diagnostics": _build_diagnostics(tips, proto, nm_per_px),
         "debug_stages": {
             "stage2_detect_points": {
                 "status": "ok" if stage2_points or tips else "no_tips",

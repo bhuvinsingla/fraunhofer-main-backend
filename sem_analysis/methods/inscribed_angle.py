@@ -1,10 +1,17 @@
-"""Method 3 — included angle at fixed diameter D (Interpretation A).
+"""Method 3 — included angle at fixed diameter D (Interpretation A — locked).
 
-Circle centred at the ultimate tip; intersect fitted edges; angle between
-vectors from apex to first intersection on each branch.
+Shared upstream: ultimate tip T = (x_t, y_t) and left/right edge contours.
 
-Named: Included angle at D100 — not a radius.
-Client must formally approve this definition (slide left Interpretation A vs B open).
+Procedure (Interpretation A):
+  1. Place a circle of predetermined diameter D centred at tip T.
+  2. Intersect that circle with edge_L and edge_R → P_L, P_R.
+  3. Output θ = included angle between rays T→P_L and T→P_R.
+
+This is NOT external tangents meeting above the circle. Field names
+left_tangent_line / right_tangent_line are historical; they store the
+ray segments tip→intersection.
+
+Named: Included angle at D{nn} — not a radius.
 """
 
 from __future__ import annotations
@@ -29,13 +36,14 @@ class InscribedAngleResult:
     angle_degrees: float | None
     angle_radians: float | None
     label: str = "angle_D100"
+    # Historical names: store ray segments tip → circle–edge intersection
     left_tangent_line: list[float] = field(default_factory=list)
     right_tangent_line: list[float] = field(default_factory=list)
     valid: bool = False
     rejection_reason: str | None = None
     definition: str = "interpretation_A_circle_at_apex"
     method: str = "included_angle_at_D"
-    tangent_from: str = "apex_to_intersections"
+    tangent_from: str = "apex_to_intersections"  # rays T→P_L / T→P_R
 
 
 def _first_circle_intersection(
@@ -81,7 +89,7 @@ def measure_inscribed_angle(
     tip_id: int = 0,
     **legacy_kwargs,
 ) -> InscribedAngleResult | None:
-    """Interpretation A: circle at apex, angle between apex→intersection vectors."""
+    """Interpretation A: circle at T, θ between rays T→P_L and T→P_R."""
     _ = legacy_kwargs
     if circle_diameter_nm is not None:
         d_nm = float(circle_diameter_nm)
@@ -174,7 +182,10 @@ def inscribed_angle_to_dict(result: InscribedAngleResult) -> dict:
         "intersection_right": list(result.intersection_right) if result.intersection_right else None,
         "left_tangent_line": result.left_tangent_line,
         "right_tangent_line": result.right_tangent_line,
+        "left_ray_line": result.left_tangent_line,
+        "right_ray_line": result.right_tangent_line,
         "valid": result.valid,
         "rejection_reason": result.rejection_reason,
         "tangent_from": result.tangent_from,
+        "note": "Interpretation A: rays T→P_L / T→P_R (not external tangents)",
     }

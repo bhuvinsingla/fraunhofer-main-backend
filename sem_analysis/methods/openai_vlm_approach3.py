@@ -343,7 +343,7 @@ def _fallback_contour_roi(roi: np.ndarray, min_pts: int = 8) -> tuple[np.ndarray
     edges = cv2.Canny(blur, 40, 120)
     ys, xs = np.where(edges > 0)
     if len(xs) < min_pts:
-        return np.zeros((0, 2), dtype=float), 0.2
+        return np.zeros((0, 2), dtype=float), 0.15
     pts = np.column_stack([xs.astype(float), ys.astype(float)])
     cy, cx = gray.shape[0] / 2.0, gray.shape[1] / 2.0
     # Prefer edge pixels near the tip (upper-middle of ROI for downward-opening V)
@@ -359,7 +359,38 @@ def _fallback_contour_roi(roi: np.ndarray, min_pts: int = 8) -> tuple[np.ndarray
     tip = tip[order]
     # Subsample evenly
     idx = np.linspace(0, len(tip) - 1, num=min(len(tip), max(min_pts, 16)), dtype=int)
-    return tip[idx], 0.35
+    tip_out = tip[idx]
+    # Provisional confidence from tip-band density (replaced after circle fit)
+    density = float(len(tip)) / max(float(len(local)), 1.0)
+    conf = float(np.clip(0.25 + 0.45 * density + 0.01 * min(len(tip_out), 20), 0.2, 0.7))
+    return tip_out, conf
+
+
+def _fit_quality_confidence(
+    residual_px: float | None,
+    radius_px: float,
+    n_pts: int,
+    *,
+    fell_back: bool = False,
+    prior: float | None = None,
+) -> float:
+    """Per-fit confidence from circle residual — not a flat placeholder."""
+    if residual_px is None or not np.isfinite(residual_px) or radius_px <= 0:
+        base = 0.35 if prior is None else float(prior)
+    else:
+        # residual / R → 0 is perfect; ~0.4+ is poor
+        rel = float(residual_px) / max(float(radius_px), 1.0)
+        base = float(np.clip(1.0 - 2.2 * rel, 0.18, 0.95))
+        if n_pts < 10:
+            base *= 0.88
+        elif n_pts >= 20:
+            base = min(0.95, base + 0.04)
+    if fell_back:
+        base = min(base, 0.72) * 0.92
+    if prior is not None and np.isfinite(prior):
+        # Blend VLM outline confidence with geometric fit quality
+        base = 0.45 * float(np.clip(prior, 0.0, 1.0)) + 0.55 * base
+    return float(round(np.clip(base, 0.15, 0.95), 3))
 
 
 def _to_uint8(image: np.ndarray) -> np.ndarray:
@@ -747,6 +778,14 @@ def run_openai_vlm_approach(
             "vlm_contour_points": contour_global.tolist(),
             "roi": {"x0": x0, "y0": y0, "half": half},
             "fit_window_px": fit_window_px,
+            "vlm_confidence": _fit_quality_confidence(
+                float(residual) if residual is not None else None,
+                float(radius_px),
+                int(len(local) if len(local) >= 5 else len(refined)),
+                fell_back=bool((cmeta or {}).get("fell_back_to_cv_contour"))
+                or bool((cmeta or {}).get("fell_back_to_cv_contour_fit")),
+                prior=float(base.get("vlm_confidence") or confidence or 0.0),
+            ),
         }
         per_curve.append(rec)
 

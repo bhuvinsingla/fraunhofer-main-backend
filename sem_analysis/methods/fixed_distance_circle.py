@@ -1,15 +1,16 @@
-"""Method 1 — fixed-distance inscribed circle (vertical drop + horizontal chord).
+"""Method 1 — fixed-distance inscribed circle → radius R.
 
-Procedure (primary l = 50 nm):
-  1. Find the tip apex (upper blue dot) — the highest point of the tip.
-  2. Move straight DOWN a fixed vertical distance l (default 50 nm).
-  3. Draw a HORIZONTAL scan line at that height; mark left/right edge crossings.
-  4. Fit a circle through apex + left + right; that radius is the tip radius.
+Shared upstream: ultimate tip T = (x_t, y_t) and left/right edge contours.
 
-All geometry is computed directly in image coordinates: l is a true vertical
-distance and the chord is horizontal (no rotation to a local tip axis).
+Procedure:
+  1. Identify ultimate tip T.
+  2. At fixed vertical distance l below T, draw horizontal line y = y_t + l.
+  3. Intersect with edge_L / edge_R → P_L, P_R.
+  4. Circumcircle through T, P_L, P_R.
+  5. Output = radius R of that circle.
 
-Interpretation: small radius = sharper tip; large radius = more rounded / blunt.
+l is a configurable constant (protocol.method1_primary_nm), held fixed across
+samples. Small R = sharper tip; large R = more rounded / blunt.
 """
 
 from __future__ import annotations
