@@ -13,6 +13,7 @@ import pandas as pd
 import yaml
 
 from sem_analysis.annotation import (
+    annotate_approach3_fixed_distance_image,
     annotate_approach3_image,
     annotate_circular_arc_image,
     annotate_image,
@@ -22,6 +23,7 @@ from sem_analysis.annotation import (
     annotate_research_image,
     annotate_validated_tips,
     annotate_whiteboard_image,
+    match_fixed_distance_to_tips,
 )
 from sem_analysis.deduction import FilteredDetection, apply_deduction
 from sem_analysis.edge_detection import EdgePeakResult, detect_edges_and_peaks, detect_serration_peaks_global
@@ -433,6 +435,7 @@ class SEMAnalysisPipeline:
                 approach3.get("failed_curves") or []
             )
             a3_path = output_dir / f"{image_path.stem}_method1_approach3.png"
+            a3_fd_path = output_dir / f"{image_path.stem}_method1_approach3_fixed_distance.png"
             try:
                 annotate_approach3_image(
                     ann_base,
@@ -444,6 +447,38 @@ class SEMAnalysisPipeline:
             except Exception as exc:  # noqa: BLE001
                 log.warning("[APPROACH 3] annotate failed: %s", exc)
                 a3_path = output_dir / f"{image_path.stem}_method1_approach3.png"
+            # Second image: fixed-distance circle construction on OpenAI Vision tips
+            a3_fd_curves = match_fixed_distance_to_tips(a3_curves, m1_curves)
+            brainstorming_methods["approach3_fixed_distance"] = {
+                "approach": "openai_tips_fixed_distance_circle",
+                "label": "OpenAI tips + fixed-distance inscribed circle",
+                "count": sum(1 for c in a3_fd_curves if c.get("valid") and c.get("radius_nm") is not None),
+                "per_curve": a3_fd_curves,
+                "median_radius_nm": None,
+            }
+            fd_radii = [
+                float(c["radius_nm"])
+                for c in a3_fd_curves
+                if c.get("valid") and c.get("radius_nm") is not None
+            ]
+            if fd_radii:
+                brainstorming_methods["approach3_fixed_distance"]["median_radius_nm"] = float(
+                    np.median(fd_radii)
+                )
+                brainstorming_methods["approach3_fixed_distance"]["mean_radius_nm"] = float(
+                    np.mean(fd_radii)
+                )
+            try:
+                annotate_approach3_fixed_distance_image(
+                    ann_base,
+                    a3_fd_curves,
+                    processed.nm_per_pixel,
+                    self.config,
+                    output_path=str(a3_fd_path),
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("[APPROACH 3] fixed-distance annotate failed: %s", exc)
+                a3_fd_path = output_dir / f"{image_path.stem}_method1_approach3_fixed_distance.png"
             log.info(
                 "[APPROACH 3] wrote %s fitted=%d mean=%s std=%s openai_ok=%s",
                 a3_path.name,
@@ -452,11 +487,18 @@ class SEMAnalysisPipeline:
                 approach3.get("std_radius_nm"),
                 (approach3.get("openai") or {}).get("ok"),
             )
+            log.info(
+                "[APPROACH 3] fixed-distance overlay wrote %s tips=%d with_R=%d",
+                a3_fd_path.name,
+                len(a3_fd_curves),
+                brainstorming_methods["approach3_fixed_distance"]["count"],
+            )
 
             annotated_method_paths = {
                 "method1": str(method1_path),
                 "method1_approach2": str(a2_path),
                 "method1_approach3": str(a3_path),
+                "method1_approach3_fixed_distance": str(a3_fd_path),
                 "method2": str(method2_path),
                 "method3": str(method3_path),
             }

@@ -95,6 +95,7 @@ def _serialize_result(result, job_id: str) -> dict:
         "method1": f"{base}/{stem}_method1.png",
         "method1_approach2": f"{base}/{stem}_method1_approach2.png",
         "method1_approach3": f"{base}/{stem}_method1_approach3.png",
+        "method1_approach3_fixed_distance": f"{base}/{stem}_method1_approach3_fixed_distance.png",
         "method2": f"{base}/{stem}_method2.png",
         "method3": f"{base}/{stem}_method3.png",
         "whiteboard": f"{base}/{stem}_whiteboard.png",

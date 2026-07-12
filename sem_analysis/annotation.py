@@ -504,6 +504,83 @@ def annotate_approach3_image(
     return img
 
 
+def match_fixed_distance_to_tips(
+    tip_curves: list[dict],
+    method1_curves: list[dict],
+    *,
+    max_dist_px: float = 40.0,
+) -> list[dict]:
+    """Pair OpenAI / Vision tips with nearest fixed-distance Method 1 geometry."""
+    matched: list[dict] = []
+    for tip_c in tip_curves:
+        tip = tip_c.get("tip_point") or tip_c.get("peak_location")
+        if not tip or len(tip) < 2:
+            continue
+        tx, ty = float(tip[0]), float(tip[1])
+        best = None
+        best_d = float("inf")
+        for m1 in method1_curves:
+            mt = m1.get("tip_point") or m1.get("peak_location")
+            if not mt or len(mt) < 2:
+                continue
+            d = math.hypot(tx - float(mt[0]), ty - float(mt[1]))
+            if d < best_d:
+                best_d = d
+                best = m1
+        if best is not None and best_d <= max_dist_px:
+            rec = dict(best)
+            rec["peak_id"] = tip_c.get("peak_id", best.get("peak_id"))
+            rec["peak_location"] = [tx, ty]
+            rec["tip_point"] = [tx, ty]
+            rec["openai_tip"] = [tx, ty]
+            matched.append(rec)
+        else:
+            matched.append(
+                {
+                    "peak_id": tip_c.get("peak_id"),
+                    "tip_point": [tx, ty],
+                    "peak_location": [tx, ty],
+                    "valid": False,
+                    "rejection_reason": "no_fixed_distance_match",
+                }
+            )
+    return matched
+
+
+def annotate_approach3_fixed_distance_image(
+    image: np.ndarray,
+    per_curve: list[dict],
+    nm_per_pixel: float,
+    config: dict,
+    output_path: str | None = None,
+) -> np.ndarray:
+    """
+    Second OpenAI Vision panel: fixed-distance inscribed-circle construction
+    (ultimate tip + red l + L/R chord hits + cyan circle) on Vision tip locations.
+    Does not modify annotate_approach3_image.
+    """
+    img = _base_image(image)
+    for i, curve in enumerate(per_curve):
+        _draw_method1_curve(img, curve, i)
+        # Keep Vision tip visible as yellow on top of the construction
+        tip = curve.get("openai_tip") or curve.get("tip_point") or curve.get("peak_location")
+        if tip:
+            _draw_dot(img, tip, YELLOW, 4)
+    cv2.putText(
+        img,
+        "OpenAI tips + fixed-distance circle: blue=3 pts  red=l+chord  cyan=R  yellow=Vision tip",
+        (12, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        BLUE,
+        2,
+        cv2.LINE_AA,
+    )
+    if output_path:
+        _save_annotated(img, output_path, nm_per_pixel, config)
+    return img
+
+
 
 def annotate_method2_image(
     image: np.ndarray,
